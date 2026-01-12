@@ -1,4 +1,4 @@
-# Nightwatch Backup Documentation
+# Nightwatch Backup Documentation 🦉🌙 
 
 Nightwatch Backup is a data preservation protocol that provides reliable, incremental backups with verification, archiving, and retention management capabilities.
 
