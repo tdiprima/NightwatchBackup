@@ -1,0 +1,301 @@
+#!/usr/bin/env bash
+# Nightwatch Backup: Data Preservation Protocol
+# MIT License
+
+set -Eeuo pipefail
+shopt -s inherit_errexit 2>/dev/null || true
+
+# ----------------------------
+# Globals + defaults
+# ----------------------------
+VERSION="1.0.0"
+APP="nightwatch-backup"
+
+CONFIG_FILE="${CONFIG_FILE:-/etc/nightwatch-backup/nightwatch-backup.conf}"
+STATE_DIR="${STATE_DIR:-/var/lib/nightwatch-backup}"
+LOG_DIR="${LOG_DIR:-/var/log/nightwatch-backup}"
+LOCK_FILE="${LOCK_FILE:-/var/lock/nightwatch-backup.lock}"
+
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+HOSTNAME_FQDN="$(hostname -f 2>/dev/null || hostname)"
+
+# ----------------------------
+# Logging
+# ----------------------------
+mkdir -p "$STATE_DIR" "$LOG_DIR"
+LOG_FILE="${LOG_FILE:-$LOG_DIR/${APP}.log}"
+
+log() {
+  # Usage: log LEVEL "message"
+  local level="$1"; shift
+  local ts; ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+  printf '%s [%s] [%s] %s\n' "$ts" "$level" "$RUN_ID" "$*" | tee -a "$LOG_FILE" >&2
+}
+
+die() { log "ERROR" "$*"; exit 1; }
+
+# ----------------------------
+# Cleanup + trap
+# ----------------------------
+cleanup() {
+  local code=$?
+  rm -f "$LOCK_FILE" 2>/dev/null || true
+  if [[ $code -ne 0 ]]; then
+    log "ERROR" "Run failed with exit code $code"
+  else
+    log "INFO" "Run completed successfully"
+  fi
+}
+trap cleanup EXIT
+
+on_err() {
+  local line="$1" cmd="$2"
+  log "ERROR" "Unhandled error at line $line: $cmd"
+}
+trap 'on_err "${LINENO}" "${BASH_COMMAND}"' ERR
+
+# ----------------------------
+# Locking (avoid overlapping runs)
+# ----------------------------
+acquire_lock() {
+  if ( set -o noclobber; echo "$$" "$LOCK_FILE" ) 2>/dev/null; then
+    log "INFO" "Lock acquired"
+  else
+    local holder
+    holder="$(cat "$LOCK_FILE" 2>/dev/null || true)"
+    die "Another run is active (lock: $LOCK_FILE holder: ${holder:-unknown})"
+  fi
+}
+
+# ----------------------------
+# Config loading + validation
+# ----------------------------
+load_config() {
+  [[ -f "$CONFIG_FILE" ]] || die "Missing config: $CONFIG_FILE"
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
+}
+
+validate_config() {
+  : "${BACKUP_NAME:?Must set BACKUP_NAME}"
+  : "${BACKUP_ROOT:?Must set BACKUP_ROOT}"
+  : "${SNAPSHOT_DIR:?Must set SNAPSHOT_DIR}"
+  : "${SOURCES:?Must set SOURCES (space-separated paths)}"
+
+  mkdir -p "$BACKUP_ROOT" "$SNAPSHOT_DIR"
+
+  require_cmd rsync
+  require_cmd sha256sum
+  require_cmd find
+  require_cmd tar
+}
+
+# ----------------------------
+# Utilities (retry, human time, etc.)
+# ----------------------------
+retry() {
+  # retry <attempts<sleep_seconds-- <cmd...>
+  local attempts="$1" sleep_s="$2"; shift 2
+  local n=1
+  while true; do
+    if "$@"; then return 0; fi
+    if [[ $n -ge $attempts ]]; then return 1; fi
+    log "WARN" "Retry $n/$attempts failed; sleeping ${sleep_s}s: $*"
+    sleep "$sleep_s"
+    n=$((n+1))
+  done
+}
+
+# ----------------------------
+# Snapshot naming + manifest
+# ----------------------------
+snapshot_path() {
+  local ts="$1"
+  echo "${SNAPSHOT_DIR}/${BACKUP_NAME}-${HOSTNAME_FQDN}-${ts}"
+}
+
+write_manifest() {
+  local snap="$1"
+  {
+    echo "app=${APP}"
+    echo "version=${VERSION}"
+    echo "run_id=${RUN_ID}"
+    echo "host=${HOSTNAME_FQDN}"
+    echo "created_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+    echo "sources=${SOURCES}"
+  } "${snap}/MANIFEST.env"
+}
+
+# ----------------------------
+# Core steps
+# ----------------------------
+create_snapshot_dir() {
+  local ts="$1"
+  local snap; snap="$(snapshot_path "$ts")"
+  mkdir -p "$snap" || die "Unable to create snapshot dir: $snap"
+  echo "$snap"
+}
+
+rsync_sources() {
+  local snap="$1"
+  local rsync_args=(
+    -aHAX --numeric-ids
+    --delete
+    --info=stats2,progress2
+    --partial --partial-dir=".rsync-partial"
+  )
+
+  # optional excludes file
+  if [[ -n "${EXCLUDES_FILE:-}" && -f "${EXCLUDES_FILE:-}" ]]; then
+    rsync_args+=(--exclude-from "$EXCLUDES_FILE")
+  fi
+
+  for src in $SOURCES; do
+    [[ -e "$src" ]] || { log "WARN" "Source missing, skipping: $src"; continue; }
+    local dest="${snap}/data$(echo "$src" | sed 's#^/##')"
+    mkdir -p "$(dirname "$dest")"
+    log "INFO" "Syncing: $src -$dest"
+    retry "${RSYNC_RETRIES:-3}" "${RSYNC_RETRY_SLEEP:-5}" \
+      rsync "${rsync_args[@]}" "$src" "$dest" \
+      || die "Rsync failed for source: $src"
+  done
+}
+
+create_archive_optional() {
+  local snap="$1"
+  if [[ "${ENABLE_TAR_ARCHIVE:-0}" -eq 1 ]]; then
+    local out="${snap}.tar${TAR_EXT:-.gz}"
+    log "INFO" "Creating archive: $out"
+    local comp_flag=()
+    case "${TAR_COMPRESSION:-gzip}" in
+      gzip) comp_flag=(-z);;
+      zstd) comp_flag=(--use-compress-program=zstd);;
+      none) comp_flag=();;
+      *) die "Unsupported TAR_COMPRESSION: ${TAR_COMPRESSION}";;
+    esac
+    tar -C "$snap" -cf "$out" "${comp_flag[@]}" . || die "Tar failed"
+  fi
+}
+
+generate_checksums() {
+  local snap="$1"
+  if [[ "${ENABLE_CHECKSUMS:-1}" -eq 1 ]]; then
+    log "INFO" "Generating SHA256 checksums"
+    (cd "$snap" && find . -type f ! -name "SHA256SUMS" -print0 \
+      | xargs -0 sha256sum SHA256SUMS) || die "Checksum generation failed"
+  fi
+}
+
+verify_snapshot() {
+  local snap="$1"
+  if [[ "${ENABLE_VERIFY:-1}" -eq 1 ]]; then
+    log "INFO" "Verifying snapshot checksums"
+    (cd "$snap" && sha256sum -c SHA256SUMS) || die "Verification failed"
+  fi
+}
+
+apply_retention() {
+  # Example: keep last N snapshots
+  local keep="${RETENTION_KEEP_LAST:-14}"
+  log "INFO" "Retention: keeping last $keep snapshots"
+
+  mapfile -t snaps < <(ls -1dt "${SNAPSHOT_DIR}/${BACKUP_NAME}-${HOSTNAME_FQDN}-"* 2>/dev/null || true)
+  local i=0
+  for s in "${snaps[@]}"; do
+    i=$((i+1))
+    if [[ $i -le $keep ]]; then continue; fi
+    log "INFO" "Removing old snapshot: $s"
+    rm -rf --one-file-system "$s" || log "WARN" "Failed to remove: $s"
+  done
+}
+
+remote_sync_optional() {
+  local snap="$1"
+  if [[ "${ENABLE_REMOTE_SYNC:-0}" -eq 1 ]]; then
+    : "${REMOTE_TARGET:?Set REMOTE_TARGET like user@host:/path}"
+    log "INFO" "Remote sync -${REMOTE_TARGET}"
+    retry 3 10 rsync -aHAX --numeric-ids "$snap/" "${REMOTE_TARGET%/}/$(basename "$snap")/" \
+      || die "Remote sync failed"
+  fi
+}
+
+notify_optional() {
+  # minimal: mailx/sendmail/msmtp/etc, you'd expand this in the "real" package
+  if [[ "${ENABLE_EMAIL:-0}" -eq 1 ]]; then
+    : "${EMAIL_TO:?Set EMAIL_TO}"
+    local subj="[${APP}] backup ${BACKUP_NAME} on ${HOSTNAME_FQDN} (${RUN_ID})"
+    local body="Backup completed. Snapshot: ${LAST_SNAPSHOT:-unknown}"
+    if command -v mail >/dev/null 2>&1; then
+      printf '%s\n' "$body" | mail -s "$subj" "$EMAIL_TO" || log "WARN" "Email failed"
+    else
+      log "WARN" "Email enabled but 'mail' not found"
+    fi
+  fi
+}
+
+# ----------------------------
+# CLI
+# ----------------------------
+usage() {
+  cat <<EOF
+${APP} ${VERSION}
+Usage:
+  ${APP} run
+  ${APP} verify <snapshot_path>
+  ${APP} list
+  ${APP} version
+
+Config:
+  CONFIG_FILE=$CONFIG_FILE
+EOF
+}
+
+cmd_run() {
+  acquire_lock
+  load_config
+  validate_config
+
+  local ts; ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  local snap; snap="$(create_snapshot_dir "$ts")"
+  LAST_SNAPSHOT="$snap"
+
+  log "INFO" "Starting backup: name=${BACKUP_NAME} snapshot=${snap}"
+  write_manifest "$snap"
+  rsync_sources "$snap"
+  generate_checksums "$snap"
+  verify_snapshot "$snap"
+  remote_sync_optional "$snap"
+  create_archive_optional "$snap"
+  apply_retention
+  notify_optional
+}
+
+cmd_verify() {
+  local snap="${1:-}"
+  [[ -n "$snap" ]] || die "verify requires snapshot path"
+  [[ -f "$snap/SHA256SUMS" ]] || die "No SHA256SUMS in $snap"
+  (cd "$snap" && sha256sum -c SHA256SUMS) || exit 2
+  log "INFO" "Verification ok: $snap"
+}
+
+cmd_list() {
+  ls -1dt "${SNAPSHOT_DIR}/${BACKUP_NAME}-${HOSTNAME_FQDN}-"* 2>/dev/null || true
+}
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    run) shift; cmd_run "$@";;
+    verify) shift; cmd_verify "$@";;
+    list) shift; load_config; cmd_list "$@";;
+    version) echo "$VERSION";;
+    ""|-h|--help) usage;;
+    *) usage; exit 2;;
+  esac
+}
+
+main "$@"

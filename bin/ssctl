@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+case "${1:-}" in
+  run) exec nightwatch-backup run;;
+  list) exec nightwatch-backup list;;
+  verify) shift; exec nightwatch-backup verify "$@";;
+  logs) exec tail -n 200 /var/log/nightwatch-backup/nightwatch-backup.log;;
+  status)
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl status nightwatch-backup.timer --no-pager || true
+    else
+      echo "systemd not available"
+    fi
+    ;;
+  *) echo "Usage: ssctl {run|list|verify|logs|status}"; exit 2;;
+esac

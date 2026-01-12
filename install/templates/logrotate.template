@@ -1,0 +1,41 @@
+# Nightwatch Backup: Data Preservation Protocol
+# Logrotate config template for /etc/logrotate.d/nightwatch-backup
+#
+# Install:
+#   sudo install -m 0644 logrotate.template /etc/logrotate.d/nightwatch-backup
+#
+# If you want stricter perms:
+#   adjust create mode + user/group
+
+/var/log/nightwatch-backup/*.log {
+    daily
+    rotate 30
+
+    # Use date-based rotated logs (nice for audits)
+    dateext
+    dateformat -%Y%m%d
+
+    # Compress old logs
+    compress
+    delaycompress
+
+    # Don't freak out if logs missing/empty
+    missingok
+    notifempty
+
+    # Keep perms sane
+    create 0640 root adm
+
+    # Avoid logrotate errors if multiple matching files
+    sharedscripts
+
+    # If your script doesn't reopen logs on SIGHUP, copytruncate is safest
+    # (slightly less "perfect" than real reopen, but reliable)
+    copytruncate
+
+    # Optional: cap size too (uncomment if desired)
+    # size 50M
+
+    # Optional: nice audit metadata
+    su root adm
+}
