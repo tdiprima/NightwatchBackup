@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+# Nightwatch Backup Verification Tool
+# ss-verify: validate snapshot integrity via SHA256SUMS + MANIFEST
+# MIT License
+
+set -Eeuo pipefail
+
+APP="ss-verify"
+VERSION="1.0.0"
+
+# Defaults (can be overridden)
+CONFIG_FILE="${CONFIG_FILE:-/etc/nightwatch-backup/nightwatch-backup.conf}"
+LOG_FILE="${LOG_FILE:-/var/log/nightwatch-backup/verify.log}"
+
+QUIET=0
+JSON=0
+STRICT=0
+FAST=0
+
+log() {
+  local level="$1"; shift
+  local ts; ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+  if [[ "$QUIET" -eq 0 ]]; then
+    printf '%s [%s] %s\n' "$ts" "$level" "$*" >&2
+  fi
+  printf '%s [%s] %s\n' "$ts" "$level" "$*" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+die() { log "ERROR" "$*"; exit 2; }
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
+}
+
+usage() {
+  cat <<EOF
+${APP} ${VERSION}
+
+Usage:
+  ss-verify <snapshot_dir> [options]
+  ss-verify --latest [options]
+
+Options:
+  --latest             Verify most recent snapshot (requires config)
+  --config FILE        Config file (default: $CONFIG_FILE)
+  --strict             Fail if MANIFEST is missing or incomplete
+  --fast               Skip optional deep checks (still verifies hashes)
+  --json               Output JSON result
+  -q, --quiet           Less output
+  -h, --help            Show help
+
+Exit codes:
+  0  verification OK
+  1  verification FAILED (integrity mismatch)
+  2  usage/config errors
+EOF
+}
+
+load_config_if_present() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+  fi
+}
+
+get_latest_snapshot() {
+  load_config_if_present
+
+  : "${SNAPSHOT_DIR:?SNAPSHOT_DIR missing in config}"
+  : "${BACKUP_NAME:?BACKUP_NAME missing in config}"
+
+  local host
+  host="$(hostname -f 2>/dev/null || hostname)"
+
+  # newest first
+  ls -1dt "${SNAPSHOT_DIR}/${BACKUP_NAME}-${host}-"* 2>/dev/null | head -n 1
+}
+
+emit_json() {
+  local status="$1"
+  local snapshot="$2"
+  local msg="$3"
+  local checked_files="${4:-0}"
+
+  # tiny JSON emitter without jq dependency
+  msg="${msg//\"/\\\"}"
+  printf '{'
+  printf '"tool":"%s",' "$APP"
+  printf '"version":"%s",' "$VERSION"
+  printf '"snapshot":"%s",' "$snapshot"
+  printf '"status":"%s",' "$status"
+  printf '"checked_files":%s,' "$checked_files"
+  printf '"message":"%s",' "$msg"
+  printf '}\n'
+}
+
+verify_manifest() {
+  local snap="$1"
+  local mf="${snap}/MANIFEST.env"
+
+  if [[ ! -f "$mf" ]]; then
+    if [[ "$STRICT" -eq 1 ]]; then
+      die "MANIFEST missing: $mf"
+    else
+      log "WARN" "MANIFEST missing: $mf"
+      return 0
+    fi
+  fi
+
+  # shellcheck disable=SC1090
+  source "$mf" || {
+    if [[ "$STRICT" -eq 1 ]]; then
+      die "Failed to parse MANIFEST: $mf"
+    else
+      log "WARN" "Failed to parse MANIFEST: $mf"
+      return 0
+    fi
+  }
+
+  # In strict mode, require key fields
+  if [[ "$STRICT" -eq 1 ]]; then
+    [[ -n "${host:-}" ]] || die "MANIFEST missing: host"
+    [[ -n "${created_utc:-}" ]] || die "MANIFEST missing: created_utc"
+    [[ -n "${version:-}" ]] || die "MANIFEST missing: version"
+    [[ -n "${sources:-}" ]] || die "MANIFEST missing: sources"
+  fi
+
+  log "INFO" "Manifest OK (host=${host:-unknown} created=${created_utc:-unknown})"
+}
+
+verify_sha256() {
+  local snap="$1"
+  local sums="${snap}/SHA256SUMS"
+
+  [[ -f "$sums" ]] || die "No SHA256SUMS found in snapshot: $snap"
+
+  log "INFO" "Verifying SHA256SUMS: $sums"
+
+  # sha256sum -c returns non-zero on mismatch
+  # We run from within snapshot so relative paths work
+  local out
+  if out="$(cd "$snap" && sha256sum -c SHA256SUMS 2>&1)"; then
+    log "INFO" "Checksum verification OK"
+    echo "$out"
+    return 0
+  else
+    log "ERROR" "Checksum verification FAILED"
+    echo "$out"
+    return 1
+  fi
+}
+
+optional_deep_checks() {
+  local snap="$1"
+  if [[ "$FAST" -eq 1 ]]; then
+    log "INFO" "Fast mode enabled: skipping deep checks"
+    return 0
+  fi
+
+  # Example deep check: ensure snapshot is not obviously empty
+  local data_dir="${snap}/data"
+  if [[ -d "$data_dir" ]]; then
+    local count
+    count="$(find "$data_dir" -type f 2>/dev/null | wc -l | tr -d ' ')"
+    if [[ "$count" -eq 0 ]]; then
+      log "WARN" "Deep check: no files found under ${data_dir}"
+    else
+      log "INFO" "Deep check: file count under data/: $count"
+    fi
+  else
+    log "WARN" "Deep check: data/ directory missing"
+  fi
+}
+
+main() {
+  require_cmd sha256sum
+  require_cmd find
+  require_cmd hostname
+
+  mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+
+  local target=""
+  local latest=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --latest) latest=1; shift;;
+      --config) CONFIG_FILE="$2"; shift 2;;
+      --strict) STRICT=1; shift;;
+      --fast) FAST=1; shift;;
+      --json) JSON=1; shift;;
+      -q|--quiet) QUIET=1; shift;;
+      -h|--help) usage; exit 0;;
+      -*)
+        usage
+        die "Unknown option: $1"
+        ;;
+      *)
+        target="$1"
+        shift
+        ;;
+    esac
+  done
+
+  if [[ "$latest" -eq 1 ]]; then
+    target="$(get_latest_snapshot || true)"
+    [[ -n "$target" ]] || die "No snapshots found for --latest"
+  fi
+
+  [[ -n "$target" ]] || { usage; exit 2; }
+  [[ -d "$target" ]] || die "Snapshot directory not found: $target"
+
+  log "INFO" "Starting verification: $target"
+
+  verify_manifest "$target"
+
+  local verify_out=""
+  if verify_out="$(verify_sha256 "$target")"; then
+    optional_deep_checks "$target"
+
+    local checked_files
+    checked_files="$(wc -l < "${target}/SHA256SUMS" | tr -d ' ')"
+
+    if [[ "$JSON" -eq 1 ]]; then
+      emit_json "ok" "$target" "verification passed" "$checked_files"
+    else
+      log "INFO" "✅ Verification PASSED: $target"
+      log "INFO" "Checked files: $checked_files"
+    fi
+    exit 0
+  else
+    if [[ "$JSON" -eq 1 ]]; then
+      emit_json "failed" "$target" "checksum mismatch detected" "0"
+    else
+      log "ERROR" "❌ Verification FAILED: $target"
+      log "ERROR" "sha256sum output:"
+      printf '%s\n' "$verify_out" >&2
+    fi
+    exit 1
+  fi
+}
+
+main "$@"
