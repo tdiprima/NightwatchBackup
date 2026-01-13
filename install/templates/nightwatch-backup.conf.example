@@ -4,8 +4,8 @@ BACKUP_NAME="prod-core"
 BACKUP_ROOT="/srv/backups"
 SNAPSHOT_DIR="/srv/backups/snapshots"
 
-# Sources (space-separated; quote paths with spaces in a real build)
-SOURCES="/etc /home /var/www /opt/apps"
+# Sources (bash array; paths with spaces are now supported)
+SOURCES=("/etc" "/home" "/var/www" "/opt/apps")
 
 # Excludes
 EXCLUDES_FILE="/etc/nightwatch-backup/excludes.txt"

@@ -129,7 +129,7 @@ CONFIG_FILE=/path/to/config.conf nightwatch-backup run
 
 ```
 ERROR: Must set BACKUP_NAME
-ERROR: Must set SOURCES (space-separated paths)
+ERROR: Must set SOURCES array with at least one path
 ```
 
 **Cause:**
@@ -150,7 +150,7 @@ Minimum required:
 BACKUP_NAME="my-backup"
 BACKUP_ROOT="/srv/backups"
 SNAPSHOT_DIR="/srv/backups/snapshots"
-SOURCES="/etc /home"
+SOURCES=("/etc" "/home")
 ```
 
 ### 4. Missing Commands
@@ -808,3 +808,5 @@ If Nightwatch Backup system fails:
 2. Use any Linux system with rsync
 3. Mount backup drive and copy files
 4. No special tools needed for recovery
+
+<br>

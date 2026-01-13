@@ -58,13 +58,18 @@ SNAPSHOT_DIR="/srv/backups/snapshots"
 
 ### SOURCES
 
-Space-separated list of source directories to back up.
+Bash array of source directories to back up.
 
 ```bash
-SOURCES="/etc /home /var/www /opt/apps"
+SOURCES=("/etc" "/home" "/var/www" "/opt/apps")
 ```
 
-- Paths with spaces should be quoted (in production deployments)
+For paths with spaces, simply include them in the array:
+
+```bash
+SOURCES=("/etc" "/home/user/My Documents" "/var/www")
+```
+
 - Non-existent paths are skipped with warning
 - Paths are preserved in snapshot structure
 
@@ -317,7 +322,7 @@ CONFIG_FILE=/home/user/backup.conf nightwatch-backup run
 BACKUP_NAME="simple-backup"
 BACKUP_ROOT="/backups"
 SNAPSHOT_DIR="/backups/snapshots"
-SOURCES="/home/user/documents"
+SOURCES=("/home/user/documents")
 ```
 
 ### Production Configuration
@@ -329,7 +334,7 @@ BACKUP_NAME="prod-web-01"
 # Paths
 BACKUP_ROOT="/srv/backups"
 SNAPSHOT_DIR="/srv/backups/snapshots"
-SOURCES="/etc /var/www /opt/apps /home"
+SOURCES=("/etc" "/var/www" "/opt/apps" "/home")
 
 # Excludes
 EXCLUDES_FILE="/etc/nightwatch-backup/excludes.txt"
@@ -368,7 +373,7 @@ BACKUP_NAME="laptop-backup"
 # Paths
 BACKUP_ROOT="/mnt/external/backups"
 SNAPSHOT_DIR="/mnt/external/backups/snapshots"
-SOURCES="/home/username"
+SOURCES=("/home/username")
 
 # Excludes
 EXCLUDES_FILE="/etc/nightwatch-backup/excludes.txt"
@@ -399,3 +404,5 @@ Nightwatch Backup validates configuration on startup. Common validation errors:
 - Set up [scheduling](SCHEDULING.md)
 - Learn about [restore procedures](RESTORE.md)
 - Review [troubleshooting](TROUBLESHOOTING.md)
+
+<br>

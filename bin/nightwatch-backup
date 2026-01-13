@@ -84,7 +84,7 @@ validate_config() {
   : "${BACKUP_NAME:?Must set BACKUP_NAME}"
   : "${BACKUP_ROOT:?Must set BACKUP_ROOT}"
   : "${SNAPSHOT_DIR:?Must set SNAPSHOT_DIR}"
-  : "${SOURCES:?Must set SOURCES (space-separated paths)}"
+  [[ ${#SOURCES[@]} -eq 0 ]] && die "Must set SOURCES array with at least one path"
 
   mkdir -p "$BACKUP_ROOT" "$SNAPSHOT_DIR"
 
@@ -126,7 +126,7 @@ write_manifest() {
     echo "run_id=${RUN_ID}"
     echo "host=${HOSTNAME_FQDN}"
     echo "created_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-    echo "sources=${SOURCES}"
+    echo "sources=${SOURCES[*]}"
   } "${snap}/MANIFEST.env"
 }
 
@@ -154,7 +154,7 @@ rsync_sources() {
     rsync_args+=(--exclude-from "$EXCLUDES_FILE")
   fi
 
-  for src in $SOURCES; do
+  for src in "${SOURCES[@]}"; do
     [[ -e "$src" ]] || { log "WARN" "Source missing, skipping: $src"; continue; }
     local dest="${snap}/data$(echo "$src" | sed 's#^/##')"
     mkdir -p "$(dirname "$dest")"

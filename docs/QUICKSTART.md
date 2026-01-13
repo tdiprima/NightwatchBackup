@@ -69,8 +69,8 @@ BACKUP_NAME="my-backup"
 BACKUP_ROOT="/srv/backups"
 SNAPSHOT_DIR="/srv/backups/snapshots"
 
-# Sources (space-separated paths)
-SOURCES="/etc /home /var/www"
+# Sources (bash array; supports paths with spaces)
+SOURCES=("/etc" "/home" "/var/www")
 ```
 
 ### Configuration Parameters
@@ -80,7 +80,7 @@ SOURCES="/etc /home /var/www"
 | `BACKUP_NAME` | Unique name for this backup set | Required |
 | `BACKUP_ROOT` | Root directory for backups | Required |
 | `SNAPSHOT_DIR` | Directory to store snapshots | Required |
-| `SOURCES` | Space-separated paths to backup | Required |
+| `SOURCES` | Bash array of paths to backup | Required |
 | `EXCLUDES_FILE` | Path to exclusion patterns file | None |
 | `RETENTION_KEEP_LAST` | Number of snapshots to keep | 21 |
 
@@ -222,3 +222,5 @@ sudo grep ERROR /var/log/nightwatch-backup/nightwatch-backup.log
 ```
 
 For more troubleshooting, see [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+
+<br>
