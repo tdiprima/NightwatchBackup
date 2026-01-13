@@ -44,9 +44,104 @@ setup_cron() {
   echo "✅ cron installed at /etc/cron.d/nightwatch-backup"
 }
 
+run_pending_migrations() {
+  local APP_ID="nightwatch-backup"
+
+  local ETC_DIR="/etc/${APP_ID}"
+  local CONFIG_FILE="${ETC_DIR}/${APP_ID}.conf"
+
+  local STATE_DIR="/var/lib/${APP_ID}"
+  local MIGRATION_STATE_FILE="${STATE_DIR}/migration-state.env"
+
+  local MIGRATIONS_DIR="./install/migrations"
+
+  mkdir -p "$STATE_DIR"
+
+  # Find last migration applied
+  local last_applied="0000"
+  if [[ -f "$MIGRATION_STATE_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$MIGRATION_STATE_FILE" || true
+    last_applied="${LAST_MIGRATION:-0000}"
+  fi
+
+  echo
+  echo "== NightwatchBackup: Migration Check =="
+  echo "Config:    $CONFIG_FILE"
+  echo "State:     $MIGRATION_STATE_FILE"
+  echo "Last seen: $last_applied"
+  echo
+
+  # No config? Then this is likely a fresh install.
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "No existing config found (fresh install). Skipping migrations."
+    return 0
+  fi
+
+  # No migrations directory? (dev packaging / partial install)
+  if [[ ! -d "$MIGRATIONS_DIR" ]]; then
+    echo "Migrations directory missing: $MIGRATIONS_DIR (skipping)"
+    return 0
+  fi
+
+  # Run migrations in lexicographic order (NNNN-*.sh)
+  local ran_any=0
+  local m base
+  while IFS= read -r -d '' m; do
+    base="$(basename "$m")"
+
+    # Only run numbered migrations
+    if [[ ! "$base" =~ ^[0-9]{4}-.*\.sh$ ]]; then
+      continue
+    fi
+
+    local id="${base:0:4}"
+
+    # Only run migrations > last applied
+    if [[ "$id" > "$last_applied" ]]; then
+      ran_any=1
+      echo "-> Applying migration: $base"
+
+      chmod +x "$m" || true
+
+      # Export helpful variables for migration scripts
+      export APP_ID
+      export ETC_DIR
+      export CONFIG_FILE
+      export STATE_DIR
+      export MIGRATION_STATE_FILE
+
+      # Run migration
+      if "$m"; then
+        # Write/update migration state only after success
+        cat > "$MIGRATION_STATE_FILE" <<EOF
+# NightwatchBackup migration state
+LAST_MIGRATION=${id}
+EOF
+        last_applied="$id"
+        echo "✅ Migration applied: $base"
+      else
+        echo "❌ Migration failed: $base"
+        echo "Stopping upgrade to avoid partial/unsafe state."
+        exit 1
+      fi
+
+      echo
+    fi
+  done < <(find "$MIGRATIONS_DIR" -maxdepth 1 -type f -print0 | sort -z)
+
+  if [[ "$ran_any" -eq 0 ]]; then
+    echo "No pending migrations."
+  else
+    echo "All migrations applied. Current level: $last_applied"
+  fi
+}
+
 main() {
   need_root
   install_files
+  # If upgrading an existing install, migrate config/state
+  # run_pending_migrations
   choose_scheduler
   echo
   echo "Done. Edit config:"
