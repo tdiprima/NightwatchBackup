@@ -58,7 +58,7 @@ trap 'on_err "${LINENO}" "${BASH_COMMAND}"' ERR
 # Locking (avoid overlapping runs)
 # ----------------------------
 acquire_lock() {
-  if ( set -o noclobber; echo "$$" "$LOCK_FILE" ) 2>/dev/null; then
+  if ( set -o noclobber; echo "$$" > "$LOCK_FILE" ) 2>/dev/null; then
     log "INFO" "Lock acquired"
   else
     local holder
@@ -98,7 +98,7 @@ validate_config() {
 # Utilities (retry, human time, etc.)
 # ----------------------------
 retry() {
-  # retry <attempts<sleep_seconds-- <cmd...>
+  # retry <attempts> <sleep_seconds> -- <cmd...>
   local attempts="$1" sleep_s="$2"; shift 2
   local n=1
   while true; do
@@ -127,7 +127,7 @@ write_manifest() {
     echo "host=${HOSTNAME_FQDN}"
     echo "created_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
     echo "sources=${SOURCES[*]}"
-  } "${snap}/MANIFEST.env"
+  } > "${snap}/MANIFEST.env"
 }
 
 # ----------------------------
@@ -158,7 +158,7 @@ rsync_sources() {
     [[ -e "$src" ]] || { log "WARN" "Source missing, skipping: $src"; continue; }
     local dest="${snap}/data$(echo "$src" | sed 's#^/##')"
     mkdir -p "$(dirname "$dest")"
-    log "INFO" "Syncing: $src -$dest"
+    log "INFO" "Syncing: $src -> $dest"
     retry "${RSYNC_RETRIES:-3}" "${RSYNC_RETRY_SLEEP:-5}" \
       rsync "${rsync_args[@]}" "$src" "$dest" \
       || die "Rsync failed for source: $src"
@@ -186,7 +186,7 @@ generate_checksums() {
   if [[ "${ENABLE_CHECKSUMS:-1}" -eq 1 ]]; then
     log "INFO" "Generating SHA256 checksums"
     (cd "$snap" && find . -type f ! -name "SHA256SUMS" -print0 \
-      | xargs -0 sha256sum SHA256SUMS) || die "Checksum generation failed"
+      | xargs -0 sha256sum > SHA256SUMS) || die "Checksum generation failed"
   fi
 }
 
@@ -217,7 +217,7 @@ remote_sync_optional() {
   local snap="$1"
   if [[ "${ENABLE_REMOTE_SYNC:-0}" -eq 1 ]]; then
     : "${REMOTE_TARGET:?Set REMOTE_TARGET like user@host:/path}"
-    log "INFO" "Remote sync -${REMOTE_TARGET}"
+    log "INFO" "Remote sync -> ${REMOTE_TARGET}"
     retry 3 10 rsync -aHAX --numeric-ids "$snap/" "${REMOTE_TARGET%/}/$(basename "$snap")/" \
       || die "Remote sync failed"
   fi
