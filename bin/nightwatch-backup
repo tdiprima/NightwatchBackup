@@ -209,7 +209,8 @@ apply_retention() {
     i=$((i+1))
     if [[ $i -le $keep ]]; then continue; fi
     log "INFO" "Removing old snapshot: $s"
-    rm -rf --one-file-system "$s" || log "WARN" "Failed to remove: $s"
+    # rm -rf --one-file-system "$s" || log "WARN" "Failed to remove: $s"
+    rm -rf "$s" || log "WARN" "Failed to remove: $s"
   done
 }
 

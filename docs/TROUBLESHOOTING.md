@@ -593,7 +593,8 @@ sudo ls -ld /srv/backups/snapshots/old-snapshot
 Remove manually:
 
 ```bash
-sudo rm -rf --one-file-system /srv/backups/snapshots/old-snapshot
+# sudo rm -rf --one-file-system /srv/backups/snapshots/old-snapshot
+sudo rm -rf /srv/backups/snapshots/old-snapshot
 ```
 
 Check if mounted:
