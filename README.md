@@ -2,6 +2,8 @@
 
 I needed a reliable, set-it-and-forget-it backup tool that runs overnight without babysitting. Existing solutions were either too complex or too fragile. So I built a bash script that does incremental rsync snapshots, verifies integrity with checksums, and cleans up old backups automatically.
 
+![](Nightwatch-backup.png)
+
 ## Requirements
 
 - Bash 4.0+, rsync, sha256sum, tar
