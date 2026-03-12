@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rsync --version 2>&1 | head -3)",
+      "Bash(which rsync:*)",
+      "Read(//usr/local/bin/**)",
+      "Read(//Users/tdiprima/bin/**)"
+    ]
+  }
+}

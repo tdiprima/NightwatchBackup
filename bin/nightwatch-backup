@@ -5,6 +5,9 @@
 set -Eeuo pipefail
 shopt -s inherit_errexit 2>/dev/null || true
 
+# Ensure Homebrew-installed tools are on PATH when run under cron/launchd
+export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"
+
 # ----------------------------
 # Globals + defaults
 # ----------------------------
@@ -26,7 +29,6 @@ mkdir -p "$STATE_DIR" "$LOG_DIR"
 LOG_FILE="${LOG_FILE:-$LOG_DIR/${APP}.log}"
 
 log() {
-  # Usage: log LEVEL "message"
   local level="$1"; shift
   local ts; ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
   printf '%s [%s] [%s] %s\n' "$ts" "$level" "$RUN_ID" "$*" | tee -a "$LOG_FILE" >&2
@@ -83,19 +85,35 @@ require_cmd() {
 validate_config() {
   : "${BACKUP_NAME:?Must set BACKUP_NAME}"
   : "${BACKUP_ROOT:?Must set BACKUP_ROOT}"
-  : "${SNAPSHOT_DIR:?Must set SNAPSHOT_DIR}"
   [[ ${#SOURCES[@]} -eq 0 ]] && die "Must set SOURCES array with at least one path"
 
-  mkdir -p "$BACKUP_ROOT" "$SNAPSHOT_DIR"
+  mkdir -p "$BACKUP_ROOT"
 
   require_cmd rsync
   require_cmd sha256sum
   require_cmd find
-  require_cmd tar
 }
 
 # ----------------------------
-# Utilities (retry, human time, etc.)
+# rsync flag detection
+# ----------------------------
+# macOS ships openrsync which does not support --acls (-A) or --xattrs (-X).
+# Probe once and build a base flag set that works on any platform.
+_rsync_base_flags=()
+_rsync_flags_detected=0
+
+detect_rsync_flags() {
+  [[ $_rsync_flags_detected -eq 1 ]] && return
+  _rsync_base_flags=(-aH --numeric-ids --delete --info=stats2,progress2
+                     --partial "--partial-dir=.rsync-partial")
+  local help; help="$(rsync --help 2>&1 || true)"
+  if printf '%s\n' "$help" | grep -qw -- '--acls';   then _rsync_base_flags+=(-A); fi
+  if printf '%s\n' "$help" | grep -qw -- '--xattrs'; then _rsync_base_flags+=(-X); fi
+  _rsync_flags_detected=1
+}
+
+# ----------------------------
+# Utilities
 # ----------------------------
 retry() {
   # retry <attempts> <sleep_seconds> -- <cmd...>
@@ -111,125 +129,57 @@ retry() {
 }
 
 # ----------------------------
-# Snapshot naming + manifest
-# ----------------------------
-snapshot_path() {
-  local ts="$1"
-  echo "${SNAPSHOT_DIR}/${BACKUP_NAME}-${HOSTNAME_FQDN}-${ts}"
-}
-
-write_manifest() {
-  local snap="$1"
-  {
-    echo "app=${APP}"
-    echo "version=${VERSION}"
-    echo "run_id=${RUN_ID}"
-    echo "host=${HOSTNAME_FQDN}"
-    echo "created_utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-    echo "sources=${SOURCES[*]}"
-  } > "${snap}/MANIFEST.env"
-}
-
-# ----------------------------
 # Core steps
 # ----------------------------
-create_snapshot_dir() {
-  local ts="$1"
-  local snap; snap="$(snapshot_path "$ts")"
-  mkdir -p "$snap" || die "Unable to create snapshot dir: $snap"
-  echo "$snap"
-}
-
 rsync_sources() {
-  local snap="$1"
-  local rsync_args=(
-    -aHAX --numeric-ids
-    --delete
-    --info=stats2,progress2
-    --partial --partial-dir=".rsync-partial"
-  )
+  detect_rsync_flags
+  local rsync_args=("${_rsync_base_flags[@]}")
 
-  # optional excludes file
   if [[ -n "${EXCLUDES_FILE:-}" && -f "${EXCLUDES_FILE:-}" ]]; then
     rsync_args+=(--exclude-from "$EXCLUDES_FILE")
   fi
 
   for src in "${SOURCES[@]}"; do
     [[ -e "$src" ]] || { log "WARN" "Source missing, skipping: $src"; continue; }
-    local dest="${snap}/data$(echo "$src" | sed 's#^/##')"
-    mkdir -p "$(dirname "$dest")"
+    local dest="${BACKUP_ROOT}/$(basename "$src")/"
+    mkdir -p "$dest"
     log "INFO" "Syncing: $src -> $dest"
     retry "${RSYNC_RETRIES:-3}" "${RSYNC_RETRY_SLEEP:-5}" \
-      rsync "${rsync_args[@]}" "$src" "$dest" \
+      rsync "${rsync_args[@]}" "$src/" "$dest" \
       || die "Rsync failed for source: $src"
   done
 }
 
-create_archive_optional() {
-  local snap="$1"
-  if [[ "${ENABLE_TAR_ARCHIVE:-0}" -eq 1 ]]; then
-    local out="${snap}.tar${TAR_EXT:-.gz}"
-    log "INFO" "Creating archive: $out"
-    local comp_flag=()
-    case "${TAR_COMPRESSION:-gzip}" in
-      gzip) comp_flag=(-z);;
-      zstd) comp_flag=(--use-compress-program=zstd);;
-      none) comp_flag=();;
-      *) die "Unsupported TAR_COMPRESSION: ${TAR_COMPRESSION}";;
-    esac
-    tar -C "$snap" -cf "$out" "${comp_flag[@]}" . || die "Tar failed"
-  fi
-}
-
 generate_checksums() {
-  local snap="$1"
   if [[ "${ENABLE_CHECKSUMS:-1}" -eq 1 ]]; then
     log "INFO" "Generating SHA256 checksums"
-    (cd "$snap" && find . -type f ! -name "SHA256SUMS" -print0 \
+    (cd "$BACKUP_ROOT" && find . -type f ! -name "SHA256SUMS" -print0 \
       | xargs -0 sha256sum > SHA256SUMS) || die "Checksum generation failed"
   fi
 }
 
-verify_snapshot() {
-  local snap="$1"
+verify_backup() {
   if [[ "${ENABLE_VERIFY:-1}" -eq 1 ]]; then
-    log "INFO" "Verifying snapshot checksums"
-    (cd "$snap" && sha256sum -c SHA256SUMS) || die "Verification failed"
+    log "INFO" "Verifying checksums"
+    (cd "$BACKUP_ROOT" && sha256sum -c SHA256SUMS) || die "Verification failed"
   fi
 }
 
-apply_retention() {
-  # Example: keep last N snapshots
-  local keep="${RETENTION_KEEP_LAST:-14}"
-  log "INFO" "Retention: keeping last $keep snapshots"
-
-  mapfile -t snaps < <(ls -1dt "${SNAPSHOT_DIR}/${BACKUP_NAME}-${HOSTNAME_FQDN}-"* 2>/dev/null || true)
-  local i=0
-  for s in "${snaps[@]}"; do
-    i=$((i+1))
-    if [[ $i -le $keep ]]; then continue; fi
-    log "INFO" "Removing old snapshot: $s"
-    # rm -rf --one-file-system "$s" || log "WARN" "Failed to remove: $s"
-    rm -rf "$s" || log "WARN" "Failed to remove: $s"
-  done
-}
-
 remote_sync_optional() {
-  local snap="$1"
   if [[ "${ENABLE_REMOTE_SYNC:-0}" -eq 1 ]]; then
     : "${REMOTE_TARGET:?Set REMOTE_TARGET like user@host:/path}"
     log "INFO" "Remote sync -> ${REMOTE_TARGET}"
-    retry 3 10 rsync -aHAX --numeric-ids "$snap/" "${REMOTE_TARGET%/}/$(basename "$snap")/" \
+    detect_rsync_flags
+    retry 3 10 rsync "${_rsync_base_flags[@]}" "$BACKUP_ROOT/" "${REMOTE_TARGET%/}/" \
       || die "Remote sync failed"
   fi
 }
 
 notify_optional() {
-  # minimal: mailx/sendmail/msmtp/etc, you'd expand this in the "real" package
   if [[ "${ENABLE_EMAIL:-0}" -eq 1 ]]; then
     : "${EMAIL_TO:?Set EMAIL_TO}"
     local subj="[${APP}] backup ${BACKUP_NAME} on ${HOSTNAME_FQDN} (${RUN_ID})"
-    local body="Backup completed. Snapshot: ${LAST_SNAPSHOT:-unknown}"
+    local body="Backup completed. Destination: ${BACKUP_ROOT}"
     if command -v mail >/dev/null 2>&1; then
       printf '%s\n' "$body" | mail -s "$subj" "$EMAIL_TO" || log "WARN" "Email failed"
     else
@@ -246,7 +196,7 @@ usage() {
 ${APP} ${VERSION}
 Usage:
   ${APP} run
-  ${APP} verify <snapshot_path>
+  ${APP} verify [path]
   ${APP} list
   ${APP} version
 
@@ -260,39 +210,34 @@ cmd_run() {
   load_config
   validate_config
 
-  local ts; ts="$(date -u +%Y%m%dT%H%M%SZ)"
-  local snap; snap="$(create_snapshot_dir "$ts")"
-  LAST_SNAPSHOT="$snap"
-
-  log "INFO" "Starting backup: name=${BACKUP_NAME} snapshot=${snap}"
-  write_manifest "$snap"
-  rsync_sources "$snap"
-  generate_checksums "$snap"
-  verify_snapshot "$snap"
-  remote_sync_optional "$snap"
-  create_archive_optional "$snap"
-  apply_retention
+  log "INFO" "Starting backup: name=${BACKUP_NAME} dest=${BACKUP_ROOT}"
+  rsync_sources
+  generate_checksums
+  verify_backup
+  remote_sync_optional
   notify_optional
 }
 
 cmd_verify() {
-  local snap="${1:-}"
-  [[ -n "$snap" ]] || die "verify requires snapshot path"
-  [[ -f "$snap/SHA256SUMS" ]] || die "No SHA256SUMS in $snap"
-  (cd "$snap" && sha256sum -c SHA256SUMS) || exit 2
-  log "INFO" "Verification ok: $snap"
+  local dir="${1:-}"
+  load_config
+  dir="${dir:-$BACKUP_ROOT}"
+  [[ -f "$dir/SHA256SUMS" ]] || die "No SHA256SUMS in $dir"
+  (cd "$dir" && sha256sum -c SHA256SUMS) || exit 2
+  log "INFO" "Verification ok: $dir"
 }
 
 cmd_list() {
-  ls -1dt "${SNAPSHOT_DIR}/${BACKUP_NAME}-${HOSTNAME_FQDN}-"* 2>/dev/null || true
+  load_config
+  ls -1d "${BACKUP_ROOT}"/*/  2>/dev/null || true
 }
 
 main() {
   local cmd="${1:-}"
   case "$cmd" in
-    run) shift; cmd_run "$@";;
-    verify) shift; cmd_verify "$@";;
-    list) shift; load_config; cmd_list "$@";;
+    run)     shift; cmd_run "$@";;
+    verify)  shift; cmd_verify "$@";;
+    list)    shift; cmd_list "$@";;
     version) echo "$VERSION";;
     ""|-h|--help) usage;;
     *) usage; exit 2;;
