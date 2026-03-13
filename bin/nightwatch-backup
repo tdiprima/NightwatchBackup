@@ -72,6 +72,20 @@ acquire_lock() {
 # ----------------------------
 # Config loading + validation
 # ----------------------------
+
+# sha256 command detection (sha256sum on Linux, shasum -a 256 on macOS)
+SHA256_CMD=()
+
+detect_sha256_cmd() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    SHA256_CMD=(sha256sum)
+  elif command -v shasum >/dev/null 2>&1; then
+    SHA256_CMD=(shasum -a 256)
+  else
+    die "No SHA-256 utility found (need sha256sum or shasum)"
+  fi
+}
+
 load_config() {
   [[ -f "$CONFIG_FILE" ]] || die "Missing config: $CONFIG_FILE"
   # shellcheck disable=SC1090
@@ -90,8 +104,8 @@ validate_config() {
   mkdir -p "$BACKUP_ROOT"
 
   require_cmd rsync
-  require_cmd sha256sum
   require_cmd find
+  detect_sha256_cmd
 }
 
 # ----------------------------
@@ -154,14 +168,14 @@ generate_checksums() {
   if [[ "${ENABLE_CHECKSUMS:-1}" -eq 1 ]]; then
     log "INFO" "Generating SHA256 checksums"
     (cd "$BACKUP_ROOT" && find . -type f ! -name "SHA256SUMS" -print0 \
-      | xargs -0 sha256sum > SHA256SUMS) || die "Checksum generation failed"
+      | xargs -0 "${SHA256_CMD[@]}" > SHA256SUMS) || die "Checksum generation failed"
   fi
 }
 
 verify_backup() {
   if [[ "${ENABLE_VERIFY:-1}" -eq 1 ]]; then
     log "INFO" "Verifying checksums"
-    (cd "$BACKUP_ROOT" && sha256sum -c SHA256SUMS) || die "Verification failed"
+    (cd "$BACKUP_ROOT" && "${SHA256_CMD[@]}" -c SHA256SUMS) || die "Verification failed"
   fi
 }
 
@@ -223,7 +237,8 @@ cmd_verify() {
   load_config
   dir="${dir:-$BACKUP_ROOT}"
   [[ -f "$dir/SHA256SUMS" ]] || die "No SHA256SUMS in $dir"
-  (cd "$dir" && sha256sum -c SHA256SUMS) || exit 2
+  detect_sha256_cmd
+  (cd "$dir" && "${SHA256_CMD[@]}" -c SHA256SUMS) || exit 2
   log "INFO" "Verification ok: $dir"
 }
 
