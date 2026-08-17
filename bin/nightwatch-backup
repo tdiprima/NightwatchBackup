@@ -102,6 +102,8 @@ validate_config() {
   [[ ${#SOURCES[@]} -eq 0 ]] && die "Must set SOURCES array with at least one path"
 
   mkdir -p "$BACKUP_ROOT"
+  # Resolve symlinks so rsync never hits ELOOP on virtual-FS paths (e.g. macOS CloudStorage)
+  BACKUP_ROOT="$(cd "$BACKUP_ROOT" && pwd -P)"
 
   require_cmd rsync
   require_cmd find
