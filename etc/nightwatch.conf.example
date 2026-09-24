@@ -1,0 +1,52 @@
+# Nightwatch Backup configuration
+# This file is sourced by bash. Use bash array syntax for lists.
+
+# Local directories to mirror. Each is mirrored to DESTINATION/<basename>/.
+SOURCES=(
+    "/home/alice/Documents"
+    "/etc"
+)
+
+# Destination root (local path or mounted volume).
+DESTINATION="/mnt/backup/nightwatch"
+
+# rsync exclude patterns.
+EXCLUDES=(
+    ".cache"
+    "node_modules"
+    "*.tmp"
+    ".DS_Store"
+)
+
+# Extra raw rsync options, if any.
+RSYNC_EXTRA_OPTS=()
+
+# Retry transient rsync failures.
+RETRIES=3
+RETRY_DELAY=30            # seconds
+
+# Seconds to wait for an existing lock before giving up (0 = fail immediately).
+LOCK_TIMEOUT=0
+
+# Mirror semantics: delete files in DESTINATION that no longer exist in SOURCES.
+DELETE_EXTRANEOUS=true
+
+# Write DESTINATION/.nightwatch/SHA256SUMS after each run.
+CHECKSUM_MANIFEST=true
+
+# Immediately re-hash sources and compare to the manifest after each run.
+VERIFY=true
+
+# rsync --bwlimit in KB/s (0 = unlimited).
+BANDWIDTH_LIMIT=0
+
+# Delete run logs older than this many days (0 = keep forever).
+KEEP_LOGS_DAYS=30
+
+# Optional shell commands run before/after (PRE_HOOK failure aborts the run).
+PRE_HOOK=""
+POST_HOOK=""
+
+# Schedule used by 'nightwatchctl schedule enable'.
+SCHEDULE="0 2 * * *"                        # cron (Linux without systemd, macOS)
+SYSTEMD_ONCALENDAR="*-*-* 02:00:00"         # systemd timer (Linux)

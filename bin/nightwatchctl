@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+# nightwatchctl - controller CLI for Nightwatch Backup
+set -o nounset
+set -o pipefail
+
+NW_HERE="$(cd "$(dirname "$0")" && pwd -P)"
+for _lib in "$NW_HERE/../lib/common.sh" "$NW_HERE/../lib/nightwatch/common.sh" "/usr/local/lib/nightwatch/common.sh"; do
+    if [ -r "$_lib" ]; then . "$_lib"; break; fi
+done
+command -v nw_log >/dev/null 2>&1 || { echo "nightwatchctl: cannot locate lib/common.sh" >&2; exit 1; }
+
+ENGINE="$NW_HERE/nightwatch.sh"
+[ -x "$ENGINE" ] || ENGINE="$NW_PREFIX/bin/nightwatch.sh"
+STATUS_FILE="$NW_STATE_DIR/last-run.status"
+LOCK_DIR="$NW_STATE_DIR/nightwatch.lock"
+
+usage() {
+cat <<USAGE
+nightwatchctl v$NW_VERSION - Nightwatch Backup controller
+
+Usage: nightwatchctl <command> [options]
+
+Commands:
+  run [-n] [-v]        Run a backup now (-n dry run, -v verbose)
+  status               Show last run result and lock state
+  verify               Re-verify destination against its SHA-256 manifest
+  logs [N]             Show the last N lines of the latest log (default 50)
+  config               Show the effective configuration
+  check                Validate config, tools, and paths without running
+  unlock               Remove a stale lock (refuses if the owner is alive)
+  schedule enable      Install cron (macOS/Linux) or systemd timer (Linux)
+  schedule disable     Remove the schedule
+  schedule status      Show schedule state
+  version
+
+Environment: NW_CONFIG=$NW_CONFIG  NW_STATE_DIR=$NW_STATE_DIR  NW_LOG_DIR=$NW_LOG_DIR
+USAGE
+}
+
+cmd_run() { exec "$ENGINE" -c "$NW_CONFIG" "$@"; }
+
+cmd_status() {
+    if [ -d "$LOCK_DIR" ]; then
+        local pid; pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || echo '?')"
+        if nw_pid_alive "$pid" 2>/dev/null; then echo "Lock:   HELD by pid $pid (backup running)"
+        else echo "Lock:   STALE (pid $pid dead) - run 'nightwatchctl unlock'"; fi
+    else
+        echo "Lock:   free"
+    fi
+    if [ ! -r "$STATUS_FILE" ]; then echo "Last run: never"; return 0; fi
+    # shellcheck disable=SC1090
+    . "$STATUS_FILE"
+    local dur=$(( ${END:-0} - ${START:-0} ))
+    echo "Last run: $RUN_ID"
+    echo "Result:   $RESULT (exit $EXIT_CODE)"
+    echo "Ended:    $(date -r "$END" +'%Y-%m-%d %H:%M:%S' 2>/dev/null || date -d "@$END" +'%Y-%m-%d %H:%M:%S')  (${dur}s)"
+    echo "Verified: $VERIFIED   Files in manifest: $FILES_IN_MANIFEST"
+    echo "Dest:     $DESTINATION"
+    echo "Log:      $LOG"
+    [ "$RESULT" = OK ] || [ "$RESULT" = DRY_RUN_OK ]
+}
+
+cmd_verify() {
+    nw_load_config "$NW_CONFIG"
+    local manifest="$DESTINATION/.nightwatch/SHA256SUMS"
+    [ -r "$manifest" ] || nw_die "No manifest at $manifest (run a backup first)"
+    echo "Verifying $(wc -l < "$manifest" | tr -d ' ') files in $DESTINATION ..."
+    if nw_sha256_check "$manifest" "$DESTINATION"; then
+        echo "Integrity OK"; return 0
+    else
+        echo "Integrity FAILED" >&2; return 4
+    fi
+}
+
+cmd_logs() {
+    local n="${1:-50}" latest
+    latest="$(ls -1t "$NW_LOG_DIR"/nightwatch-*.log 2>/dev/null | head -1)"
+    [ -n "$latest" ] || nw_die "No logs in $NW_LOG_DIR"
+    echo "== $latest =="; tail -n "$n" "$latest"
+}
+
+cmd_config() {
+    nw_load_config "$NW_CONFIG"
+    echo "CONFIG=$NW_CONFIG_LOADED"
+    printf 'SOURCES=%s\n' "${SOURCES[*]}"
+    echo "DESTINATION=$DESTINATION"
+    printf 'EXCLUDES=%s\n' "${EXCLUDES[*]:-}"
+    echo "RETRIES=$RETRIES RETRY_DELAY=$RETRY_DELAY LOCK_TIMEOUT=$LOCK_TIMEOUT"
+    echo "VERIFY=$VERIFY CHECKSUM_MANIFEST=$CHECKSUM_MANIFEST DELETE_EXTRANEOUS=$DELETE_EXTRANEOUS"
+    echo "BANDWIDTH_LIMIT=$BANDWIDTH_LIMIT KEEP_LOGS_DAYS=$KEEP_LOGS_DAYS"
+    echo "SCHEDULE=${SCHEDULE:-0 2 * * *}"
+}
+
+cmd_check() {
+    local ok=0
+    for t in rsync find awk; do
+        command -v "$t" >/dev/null 2>&1 && echo "ok    $t" || { echo "MISSING $t"; ok=1; }
+    done
+    nw_sha256 /dev/null >/dev/null 2>&1 && echo "ok    sha256 (via $(command -v sha256sum || command -v shasum || command -v openssl))" || { echo "MISSING sha256 tool"; ok=1; }
+    nw_load_config "$NW_CONFIG" && echo "ok    config $NW_CONFIG_LOADED"
+    [ -d "$DESTINATION" ] && [ -w "$DESTINATION" ] && echo "ok    destination writable" || echo "warn  destination missing/unwritable (will attempt mkdir): $DESTINATION"
+    [ -x "$ENGINE" ] && echo "ok    engine $ENGINE" || { echo "MISSING engine $ENGINE"; ok=1; }
+    mkdir -p "$NW_STATE_DIR" "$NW_LOG_DIR" 2>/dev/null && echo "ok    state/log dirs" || { echo "FAIL  cannot create $NW_STATE_DIR / $NW_LOG_DIR"; ok=1; }
+    return $ok
+}
+
+cmd_unlock() {
+    [ -d "$LOCK_DIR" ] || { echo "No lock present"; return 0; }
+    local pid; pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || echo '')"
+    if [ -n "$pid" ] && nw_pid_alive "$pid"; then nw_die "Refusing: pid $pid is still running"; fi
+    rm -rf "$LOCK_DIR" && echo "Stale lock removed"
+}
+
+# --- scheduling -------------------------------------------------------------
+CRON_TAG="# nightwatch-backup"
+have_systemd() { [ "$(nw_os)" = linux ] && command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; }
+
+schedule_enable() {
+    nw_load_config "$NW_CONFIG"
+    local sched="${SCHEDULE:-0 2 * * *}"
+    if have_systemd; then
+        [ "$(id -u)" -eq 0 ] || nw_die "systemd scheduling requires root"
+        local oncal="${SYSTEMD_ONCALENDAR:-*-*-* 02:00:00}"
+        cat > /etc/systemd/system/nightwatch.service <<UNIT
+[Unit]
+Description=Nightwatch Backup
+After=network-online.target local-fs.target
+
+[Service]
+Type=oneshot
+Environment=NW_CONFIG=$NW_CONFIG
+ExecStart=$ENGINE -q -c $NW_CONFIG
+Nice=10
+IOSchedulingClass=idle
+UNIT
+        cat > /etc/systemd/system/nightwatch.timer <<UNIT
+[Unit]
+Description=Nightwatch Backup timer
+
+[Timer]
+OnCalendar=$oncal
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+UNIT
+        systemctl daemon-reload
+        systemctl enable --now nightwatch.timer
+        echo "systemd timer enabled (OnCalendar=$oncal)"
+    else
+        command -v crontab >/dev/null 2>&1 || nw_die "crontab not found"
+        local line="$sched NW_CONFIG=$NW_CONFIG $ENGINE -q -c $NW_CONFIG $CRON_TAG"
+        { crontab -l 2>/dev/null | grep -v "$CRON_TAG"; echo "$line"; } | crontab -
+        echo "cron entry installed: $sched"
+    fi
+}
+
+schedule_disable() {
+    if have_systemd && [ -f /etc/systemd/system/nightwatch.timer ]; then
+        systemctl disable --now nightwatch.timer 2>/dev/null || true
+        rm -f /etc/systemd/system/nightwatch.timer /etc/systemd/system/nightwatch.service
+        systemctl daemon-reload
+        echo "systemd timer removed"
+    fi
+    if command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -q "$CRON_TAG"; then
+        crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
+        echo "cron entry removed"
+    fi
+}
+
+schedule_status() {
+    if have_systemd && [ -f /etc/systemd/system/nightwatch.timer ]; then
+        systemctl list-timers nightwatch.timer --no-pager 2>/dev/null || true
+    fi
+    if command -v crontab >/dev/null 2>&1; then
+        local c; c="$(crontab -l 2>/dev/null | grep "$CRON_TAG" || true)"
+        [ -n "$c" ] && echo "cron: $c" || echo "cron: not scheduled"
+    fi
+}
+
+case "${1:-}" in
+    run)      shift; cmd_run "$@" ;;
+    status)   cmd_status ;;
+    verify)   cmd_verify ;;
+    logs)     shift; cmd_logs "$@" ;;
+    config)   cmd_config ;;
+    check)    cmd_check ;;
+    unlock)   cmd_unlock ;;
+    schedule)
+        case "${2:-}" in
+            enable)  schedule_enable ;;
+            disable) schedule_disable ;;
+            status)  schedule_status ;;
+            *) usage; exit 1 ;;
+        esac ;;
+    version)  echo "nightwatchctl $NW_VERSION" ;;
+    -h|--help|help|"") usage ;;
+    *) echo "Unknown command: $1" >&2; usage; exit 1 ;;
+esac

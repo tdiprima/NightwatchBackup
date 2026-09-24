@@ -1,0 +1,10 @@
+[Unit]
+Description=Nightwatch Backup
+After=network-online.target local-fs.target
+
+[Service]
+Type=oneshot
+Environment=NW_CONFIG=/etc/nightwatch/nightwatch.conf
+ExecStart=/usr/local/bin/nightwatch.sh -q
+Nice=10
+IOSchedulingClass=idle

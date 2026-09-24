@@ -1,0 +1,3 @@
+# Nightwatch Backup - drop into /etc/cron.d/nightwatch (Linux) or add via `crontab -e`
+# m h dom mon dow  user  command
+0 2 * * * root NW_CONFIG=/etc/nightwatch/nightwatch.conf /usr/local/bin/nightwatch.sh -q # nightwatch-backup
