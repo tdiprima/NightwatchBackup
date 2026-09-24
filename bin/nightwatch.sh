@@ -9,13 +9,14 @@
 #   -v          verbose rsync output
 #
 # Exit codes: 0 ok, 1 fatal/config, 2 already running, 3 rsync failed after retries,
-#             4 verification failed, 5 hook failed
+#             4 verification/manifest failed, 5 hook failed
 
 set -o nounset
 set -o pipefail
 
 NW_HERE="$(cd "$(dirname "$0")" && pwd -P)"
 for _lib in "$NW_HERE/../lib/common.sh" "$NW_HERE/../lib/nightwatch/common.sh" "/usr/local/lib/nightwatch/common.sh"; do
+    # shellcheck disable=SC1090
     if [ -r "$_lib" ]; then . "$_lib"; break; fi
 done
 command -v nw_log >/dev/null 2>&1 || { echo "nightwatch: cannot locate lib/common.sh" >&2; exit 1; }
@@ -36,61 +37,68 @@ command -v rsync >/dev/null 2>&1 || nw_die "rsync not found in PATH"
 nw_load_config "$NW_CONFIG"
 
 mkdir -p "$NW_STATE_DIR" "$NW_LOG_DIR" 2>/dev/null || nw_die "Cannot create $NW_STATE_DIR / $NW_LOG_DIR"
-RUN_ID="$(date +%Y%m%d-%H%M%S)"
+RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
 NW_LOG_FILE="$NW_LOG_DIR/nightwatch-$RUN_ID.log"
 STATUS_FILE="$NW_STATE_DIR/last-run.status"
 LOCK_DIR="$NW_STATE_DIR/nightwatch.lock"
 
 # ---------------------------------------------------------------------------
-# Status file writer (consumed by nightwatchctl status)
+# Status file writer (consumed by nightwatchctl status). Values are %q-escaped
+# so the file is safe to source even when paths contain spaces or quotes.
 # ---------------------------------------------------------------------------
 START_TS="$(nw_now)"
+VERIFIED=no; MANIFEST_COUNT=0; FINALIZED=0
 write_status() {
     local result="$1" rc="$2"
     local tmp="$STATUS_FILE.tmp.$$"
     {
-        echo "RUN_ID=$RUN_ID"
-        echo "RESULT=$result"
-        echo "EXIT_CODE=$rc"
-        echo "START=$START_TS"
-        echo "END=$(nw_now)"
-        echo "CONFIG=$NW_CONFIG_LOADED"
-        echo "DESTINATION=$DESTINATION"
-        echo "LOG=$NW_LOG_FILE"
-        echo "VERIFIED=${VERIFIED:-no}"
-        echo "FILES_IN_MANIFEST=${MANIFEST_COUNT:-0}"
-        echo "DRY_RUN=$DRY_RUN"
+        printf 'RUN_ID=%q\n'            "$RUN_ID"
+        printf 'RESULT=%q\n'            "$result"
+        printf 'EXIT_CODE=%q\n'         "$rc"
+        printf 'START=%q\n'             "$START_TS"
+        printf 'END=%q\n'               "$(nw_now)"
+        printf 'CONFIG=%q\n'            "$NW_CONFIG_LOADED"
+        printf 'DESTINATION=%q\n'       "$DESTINATION"
+        printf 'LOG=%q\n'               "$NW_LOG_FILE"
+        printf 'VERIFIED=%q\n'          "$VERIFIED"
+        printf 'FILES_IN_MANIFEST=%q\n' "$MANIFEST_COUNT"
+        printf 'DRY_RUN=%q\n'           "$DRY_RUN"
     } > "$tmp" && mv -f "$tmp" "$STATUS_FILE"
 }
+finish() { write_status "$1" "$2"; FINALIZED=1; exit "$2"; }
 
 # ---------------------------------------------------------------------------
-# Locking: mkdir is atomic on both platforms (no flock on macOS by default)
+# Locking. mkdir is atomic on both platforms (macOS lacks flock by default).
+# Stale-lock reclamation is serialized by renaming the lock dir: only one
+# process can win the rename, so two reclaimers can never delete each other's
+# freshly created lock.
 # ---------------------------------------------------------------------------
+HAVE_LOCK=0
 acquire_lock() {
-    local waited=0
+    local waited=0 owner stale
     while ! mkdir "$LOCK_DIR" 2>/dev/null; do
-        local owner=""
-        [ -r "$LOCK_DIR/pid" ] && owner="$(cat "$LOCK_DIR/pid" 2>/dev/null)"
+        owner="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
         if [ -n "$owner" ] && ! nw_pid_alive "$owner"; then
-            nw_warn "Removing stale lock (pid $owner is dead)"
-            rm -rf "$LOCK_DIR"
+            stale="$LOCK_DIR.stale.$$"
+            if mv "$LOCK_DIR" "$stale" 2>/dev/null; then
+                nw_warn "Removed stale lock (pid $owner is dead)"
+                rm -rf "$stale"
+            fi
             continue
         fi
         if [ "$LOCK_TIMEOUT" -gt 0 ] && [ "$waited" -lt "$LOCK_TIMEOUT" ]; then
             sleep 5; waited=$((waited+5)); continue
         fi
         nw_error "Another Nightwatch run is active (pid ${owner:-unknown}); exiting"
-        write_status "SKIPPED_LOCKED" 2
-        exit 2
+        finish "SKIPPED_LOCKED" 2
     done
     echo $$ > "$LOCK_DIR/pid"
     HAVE_LOCK=1
 }
-HAVE_LOCK=0
 cleanup() {
     local rc=$?
     [ "$HAVE_LOCK" = 1 ] && rm -rf "$LOCK_DIR"
-    if [ "$rc" -ne 0 ] && [ "${FINALIZED:-0}" = 0 ]; then
+    if [ "$rc" -ne 0 ] && [ "$FINALIZED" = 0 ]; then
         write_status "FAILED" "$rc"
     fi
     exit "$rc"
@@ -110,18 +118,16 @@ acquire_lock
 
 if [ -n "$PRE_HOOK" ]; then
     nw_info "Running PRE_HOOK"
-    if ! bash -c "$PRE_HOOK" >>"$NW_LOG_FILE" 2>&1; then
-        write_status "FAILED_PRE_HOOK" 5; FINALIZED=1; exit 5
-    fi
+    bash -c "$PRE_HOOK" >>"$NW_LOG_FILE" 2>&1 || finish "FAILED_PRE_HOOK" 5
 fi
 
 # rsync options. -a preserves perms/times/symlinks; -H hardlinks; --partial for resumability.
 RSYNC_OPTS=(-a -H --partial --numeric-ids --stats)
 [ "$DELETE_EXTRANEOUS" = true ] && RSYNC_OPTS+=(--delete --delete-excluded)
 [ "$DRY_RUN" = 1 ] && RSYNC_OPTS+=(--dry-run)
-[ "$VERBOSE" = 1 ] && RSYNC_OPTS+=(-v --progress) || RSYNC_OPTS+=(--info=progress0)
+[ "$VERBOSE" = 1 ] && RSYNC_OPTS+=(-v --progress)
 [ "${BANDWIDTH_LIMIT:-0}" != 0 ] && RSYNC_OPTS+=("--bwlimit=$BANDWIDTH_LIMIT")
-# macOS extended attributes / resource forks when using Apple's or Homebrew rsync
+# macOS extended attributes when the installed rsync supports them
 if [ "$(nw_os)" = macos ] && rsync --help 2>&1 | grep -q -- '--xattrs'; then
     RSYNC_OPTS+=(-X)
 fi
@@ -131,7 +137,7 @@ done
 [ "${#RSYNC_EXTRA_OPTS[@]}" -gt 0 ] && RSYNC_OPTS+=("${RSYNC_EXTRA_OPTS[@]}")
 
 # Each source is mirrored to DESTINATION/<basename>/ (so /home/alice -> DEST/alice/).
-# Retry on transient rsync codes: 10/11/12 (I/O, socket), 23/24 (partial, vanished), 30 (timeout), 35.
+# Retry on transient rsync codes: 10/11/12 (I/O, socket), 23 (partial), 30 (timeout), 35.
 run_rsync() {
     local src="$1" dst="$2" attempt=1 rc
     while :; do
@@ -155,76 +161,91 @@ run_rsync() {
 OVERALL_RC=0
 for src in "${SOURCES[@]}"; do
     src="$(nw_abspath "$src")"
-    name="$(basename "$src")"
-    dst="$DESTINATION/$name"
-    [ "$DRY_RUN" = 1 ] || mkdir -p "$dst"
-    if ! run_rsync "$src" "$dst"; then
-        OVERALL_RC=3
-    fi
+    dst="$DESTINATION/$(basename "$src")"
+    [ "$DRY_RUN" = 1 ] || mkdir -p "$dst" || nw_die "Cannot create $dst"
+    run_rsync "$src" "$dst" || OVERALL_RC=3
 done
-
-if [ "$OVERALL_RC" -ne 0 ]; then
-    write_status "FAILED_RSYNC" 3; FINALIZED=1; exit 3
-fi
+[ "$OVERALL_RC" -eq 0 ] || finish "FAILED_RSYNC" 3
 
 if [ "$DRY_RUN" = 1 ]; then
     nw_info "Dry run complete"
-    write_status "DRY_RUN_OK" 0; FINALIZED=1; exit 0
+    finish "DRY_RUN_OK" 0
 fi
 
 # ---------------------------------------------------------------------------
-# SHA-256 manifest + immediate verification
+# SHA-256 manifest + immediate verification. Any hash or write failure is fatal:
+# a backup is never reported as verified unless every file was hashed and matched.
 # ---------------------------------------------------------------------------
-MANIFEST_COUNT=0
-VERIFIED=no
 if [ "$CHECKSUM_MANIFEST" = true ]; then
     MANIFEST="$DESTINATION/.nightwatch/SHA256SUMS"
-    mkdir -p "$DESTINATION/.nightwatch"
+    mkdir -p "$DESTINATION/.nightwatch" || nw_die "Cannot create $DESTINATION/.nightwatch"
     tmp_manifest="$MANIFEST.tmp.$$"
+    hash_err="$NW_STATE_DIR/hash-errors-$RUN_ID.txt"
+    : > "$hash_err"
     nw_info "Generating SHA-256 manifest"
-    : > "$tmp_manifest"
+    : > "$tmp_manifest" || nw_die "Cannot write $tmp_manifest"
     for src in "${SOURCES[@]}"; do
         name="$(basename "$(nw_abspath "$src")")"
-        # NUL-safe walk; paths written relative to DESTINATION.
+        # NUL-safe walk; paths written relative to DESTINATION with sha256sum escaping.
         ( cd "$DESTINATION" && find "$name" -type f -print0 ) | while IFS= read -r -d '' f; do
-            h="$(nw_sha256 "$DESTINATION/$f")" || { nw_error "hash failed: $f"; continue; }
-            printf '%s  %s\n' "$h" "$f"
+            if h="$(nw_sha256 "$DESTINATION/$f")" && [ -n "$h" ]; then
+                nw_manifest_encode "$f" "$h" || { printf 'write %s\n' "$f" >> "$hash_err"; }
+            else
+                printf 'hash %s\n' "$f" >> "$hash_err"
+            fi
         done >> "$tmp_manifest"
+        st=("${PIPESTATUS[@]}")
+        if [ "${st[0]}" -ne 0 ] || [ "${st[1]}" -ne 0 ]; then
+            nw_error "Manifest generation failed for $name (find=${st[0]} loop=${st[1]})"
+            rm -f "$tmp_manifest"; finish "FAILED_MANIFEST" 4
+        fi
     done
-    mv -f "$tmp_manifest" "$MANIFEST"
+    if [ -s "$hash_err" ]; then
+        nw_error "Manifest incomplete: $(wc -l < "$hash_err" | tr -d ' ') file(s) could not be hashed (see $hash_err)"
+        rm -f "$tmp_manifest"; finish "FAILED_MANIFEST" 4
+    fi
+    rm -f "$hash_err"
+    sync 2>/dev/null || true
+    mv -f "$tmp_manifest" "$MANIFEST" || nw_die "Cannot write $MANIFEST"
     MANIFEST_COUNT="$(wc -l < "$MANIFEST" | tr -d ' ')"
     nw_info "Manifest written: $MANIFEST ($MANIFEST_COUNT files)"
 
     if [ "$VERIFY" = true ]; then
         nw_info "Verifying destination against source (SHA-256)"
-        # Compare destination hash to a fresh source hash for each manifest entry.
-        vfail=0; vfail_list="$NW_STATE_DIR/verify-failures-$RUN_ID.txt"; : > "$vfail_list"
+        vfail=0; vskip=0; verr=0
+        vfail_list="$NW_STATE_DIR/verify-failures-$RUN_ID.txt"; : > "$vfail_list"
         while IFS= read -r line || [ -n "$line" ]; do
-            h="${line%% *}"; rel="${line#*  }"
+            [ -z "$line" ] && continue
+            nw_manifest_decode "$line"
+            h="$NW_M_HASH"; rel="$NW_M_PATH"
             top="${rel%%/*}"; rest="${rel#*/}"
             [ "$top" = "$rel" ] && rest=""
-            # locate source root matching this top-level name
             srcroot=""
             for s in "${SOURCES[@]}"; do
                 [ "$(basename "$(nw_abspath "$s")")" = "$top" ] && { srcroot="$(nw_abspath "$s")"; break; }
             done
-            [ -n "$srcroot" ] || continue
+            if [ -z "$srcroot" ]; then
+                printf 'NOSOURCE %s\n' "$rel" >> "$vfail_list"; verr=$((verr+1)); continue
+            fi
             srcfile="$srcroot${rest:+/$rest}"
             if [ ! -f "$srcfile" ]; then
-                # Source changed since sync; not a corruption in the backup.
-                continue
+                # Source deleted since sync: not backup corruption, but recorded.
+                vskip=$((vskip+1)); continue
             fi
-            sh="$(nw_sha256 "$srcfile")" || continue
+            if ! sh="$(nw_sha256 "$srcfile")" || [ -z "$sh" ]; then
+                printf 'HASHERR  %s\n' "$rel" >> "$vfail_list"; verr=$((verr+1)); continue
+            fi
             if [ "$sh" != "$h" ]; then
-                printf '%s\n' "$rel" >> "$vfail_list"; vfail=$((vfail+1))
+                printf 'MISMATCH %s\n' "$rel" >> "$vfail_list"; vfail=$((vfail+1))
             fi
         done < "$MANIFEST"
-        if [ "$vfail" -gt 0 ]; then
-            nw_error "Verification FAILED: $vfail file(s) differ (see $vfail_list)"
-            write_status "FAILED_VERIFY" 4; FINALIZED=1; exit 4
+        if [ "$vfail" -gt 0 ] || [ "$verr" -gt 0 ]; then
+            nw_error "Verification FAILED: $vfail mismatch(es), $verr error(s) (see $vfail_list)"
+            finish "FAILED_VERIFY" 4
         fi
         rm -f "$vfail_list"
         VERIFIED=yes
+        [ "$vskip" -gt 0 ] && nw_warn "$vskip source file(s) vanished after sync; skipped in verification"
         nw_info "Verification OK"
     fi
 fi
@@ -234,12 +255,9 @@ if [ -n "$POST_HOOK" ]; then
     bash -c "$POST_HOOK" >>"$NW_LOG_FILE" 2>&1 || nw_warn "POST_HOOK exited non-zero"
 fi
 
-# Log rotation
 if [ "${KEEP_LOGS_DAYS:-0}" -gt 0 ]; then
     find "$NW_LOG_DIR" -name 'nightwatch-*.log' -type f -mtime +"$KEEP_LOGS_DAYS" -delete 2>/dev/null || true
 fi
 
-ELAPSED=$(( $(nw_now) - START_TS ))
-nw_info "Backup complete in ${ELAPSED}s"
-write_status "OK" 0; FINALIZED=1
-exit 0
+nw_info "Backup complete in $(( $(nw_now) - START_TS ))s"
+finish "OK" 0

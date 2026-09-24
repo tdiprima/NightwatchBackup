@@ -5,7 +5,7 @@ Configuration-driven rsync mirror for local folders. Bash only, runs on Linux an
 - rsync mirror (`-aH --delete`), optional bandwidth limit and excludes
 - Atomic `mkdir` lockfile with stale-lock detection; no concurrent runs
 - Retry on transient rsync errors (I/O, partial transfer, timeout)
-- SHA-256 manifest written to `DESTINATION/.nightwatch/SHA256SUMS`
+- SHA-256 manifest written to `DESTINATION/.nightwatch/SHA256SUMS` (sha256sum format, `sha256sum -c` compatible)
 - Immediate post-run verification: destination hashes compared to a fresh source hash
 - `nightwatchctl` controller: run, status, verify, logs, check, unlock, schedule
 - Scheduling via systemd timer (Linux) or cron (Linux/macOS)
@@ -38,6 +38,10 @@ NW_CONFIG=./my.conf NW_STATE_DIR=/tmp/nw/state NW_LOG_DIR=/tmp/nw/logs ./bin/nig
 
 See `etc/nightwatch.conf.example`. Each source in `SOURCES` is mirrored to `DESTINATION/<basename>/`.
 
+Validation rejects: duplicate source basenames, `/` as a source, a destination inside a source, and a source inside the destination.
+
+`nightwatchctl verify` checks the destination against its manifest only, so it works when the source disk is offline.
+
 ## Exit codes
 
 | Code | Meaning                         |
@@ -46,7 +50,7 @@ See `etc/nightwatch.conf.example`. Each source in `SOURCES` is mirrored to `DEST
 | 1    | Fatal / config error            |
 | 2    | Another run holds the lock      |
 | 3    | rsync failed after retries      |
-| 4    | Integrity verification failed   |
+| 4    | Manifest or verification failed |
 | 5    | PRE_HOOK failed                 |
 
 ## Layout

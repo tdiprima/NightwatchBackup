@@ -55,27 +55,34 @@ nw_die()   { nw_error "$@"; exit 1; }
 # Portable helpers
 # ---------------------------------------------------------------------------
 
-# SHA-256 of a file; prints "<hash>" only.
+# SHA-256 of a file; prints "<hash>" only. Hashes via stdin so the tool never
+# prints (or escapes) the filename, and validates the result is 64 hex chars.
 nw_sha256() {
+    local h
     if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum -- "$1" | awk '{print $1}'
+        h="$(sha256sum < "$1" | awk '{print $1}')"
     elif command -v shasum >/dev/null 2>&1; then
-        shasum -a 256 -- "$1" | awk '{print $1}'
+        h="$(shasum -a 256 < "$1" | awk '{print $1}')"
     elif command -v openssl >/dev/null 2>&1; then
-        openssl dgst -sha256 -- "$1" | awk '{print $NF}'
+        h="$(openssl dgst -sha256 < "$1" | awk '{print $NF}')"
     else
         return 127
-    fi
+    fi || return 1
+    case "$h" in
+        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) [ "${#h}" -eq 64 ] || return 1 ;;
+        *) return 1 ;;
+    esac
+    printf '%s\n' "$h"
 }
 
 # Verify a checksum manifest (sha256sum format: "<hash>  <path>") from a dir.
 # Prints failing paths; returns 0 if all ok.
 nw_sha256_check() {
-    local manifest="$1" base="$2" rc=0 hash path actual
+    local manifest="$1" base="$2" rc=0 hash path actual line
     while IFS= read -r line || [ -n "$line" ]; do
         [ -z "$line" ] && continue
-        hash="${line%% *}"
-        path="${line#*  }"
+        nw_manifest_decode "$line"
+        hash="$NW_M_HASH"; path="$NW_M_PATH"
         if [ ! -f "$base/$path" ]; then
             printf 'MISSING  %s\n' "$path"; rc=1; continue
         fi
@@ -115,8 +122,41 @@ nw_pid_alive() { kill -0 "$1" 2>/dev/null; }
 # ---------------------------------------------------------------------------
 # Config loading (sourced KEY=value shell file, validated afterward)
 # ---------------------------------------------------------------------------
+# Manifest path encoding (sha256sum convention): if a path contains a newline
+# or backslash, the line is prefixed with "\" and the path has "\" -> "\\", NL -> "\n".
+nw_manifest_encode() {
+    local p="$1"
+    case "$p" in
+        *\\*|*$'\n'*)
+            p="${p//\\/\\\\}"; p="${p//$'\n'/\\n}"
+            printf '\\%s  %s\n' "$2" "$p" ;;
+        *)  printf '%s  %s\n' "$2" "$p" ;;
+    esac
+}
+# Parse one manifest line into NW_M_HASH / NW_M_PATH.
+nw_manifest_decode() {
+    local line="$1" esc=0
+    case "$line" in \\*) esc=1; line="${line#\\}";; esac
+    NW_M_HASH="${line%%  *}"
+    NW_M_PATH="${line#*  }"
+    if [ "$esc" = 1 ]; then
+        local ph=$'\x01'
+        NW_M_PATH="${NW_M_PATH//\\\\/$ph}"
+        NW_M_PATH="${NW_M_PATH//\\n/$'\n'}"
+        NW_M_PATH="${NW_M_PATH//$ph/\\}"
+    fi
+}
+
+# True if $2 equals $1 or is inside directory $1 (both absolute).
+nw_path_within() {
+    local parent="${1%/}/" child="${2%/}/"
+    [ "$parent" = "$child" ] || [ "${child#"$parent"}" != "$child" ]
+}
+
+# nw_load_config CONFIG [lenient]
+#   lenient: skip checks that need the sources to be present (used by verify).
 nw_load_config() {
-    local cfg="${1:-$NW_CONFIG}"
+    local cfg="${1:-$NW_CONFIG}" lenient="${2:-}"
     [ -r "$cfg" ] || nw_die "Config not readable: $cfg"
     # Defaults
     SOURCES=()
@@ -143,8 +183,24 @@ nw_load_config() {
     case "$RETRIES" in ''|*[!0-9]*) nw_die "Config: RETRIES must be an integer";; esac
     case "$RETRY_DELAY" in ''|*[!0-9]*) nw_die "Config: RETRY_DELAY must be an integer";; esac
     case "$LOCK_TIMEOUT" in ''|*[!0-9]*) nw_die "Config: LOCK_TIMEOUT must be an integer";; esac
-    local s
+    [ -n "$lenient" ] && return 0
+
+    local s a name dest_abs seen=""
     for s in "${SOURCES[@]}"; do
         [ -d "$s" ] || nw_die "Config: source is not a directory: $s"
+    done
+    dest_abs="$(nw_abspath "$DESTINATION" 2>/dev/null || printf '%s' "$DESTINATION")"
+    for s in "${SOURCES[@]}"; do
+        a="$(nw_abspath "$s")"
+        name="$(basename "$a")"
+        [ "$a" = "/" ] && nw_die "Config: refusing to back up / as a source"
+        case "$seen" in *"|$name|"*) nw_die "Config: two sources share the name '$name' and would overwrite each other in $DESTINATION";; esac
+        seen="$seen|$name|"
+        if nw_path_within "$a" "$dest_abs"; then
+            nw_die "Config: DESTINATION ($dest_abs) is inside source $a (recursive backup)"
+        fi
+        if nw_path_within "$dest_abs" "$a"; then
+            nw_die "Config: source $a is inside DESTINATION ($dest_abs)"
+        fi
     done
 }

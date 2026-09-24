@@ -61,7 +61,7 @@ cmd_status() {
 }
 
 cmd_verify() {
-    nw_load_config "$NW_CONFIG"
+    nw_load_config "$NW_CONFIG" lenient
     local manifest="$DESTINATION/.nightwatch/SHA256SUMS"
     [ -r "$manifest" ] || nw_die "No manifest at $manifest (run a backup first)"
     echo "Verifying $(wc -l < "$manifest" | tr -d ' ') files in $DESTINATION ..."
@@ -115,25 +115,33 @@ cmd_unlock() {
 CRON_TAG="# nightwatch-backup"
 have_systemd() { [ "$(nw_os)" = linux ] && command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; }
 
+# systemd quoting: double-quote the word, escape backslash and double quote.
+sd_quote() { local v="$1"; v="${v//\\/\\\\}"; v="${v//\"/\\\"}"; printf '"%s"' "$v"; }
+# sh single-quote for cron command lines.
+sh_quote() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+
 schedule_enable() {
-    nw_load_config "$NW_CONFIG"
+    nw_load_config "$NW_CONFIG" lenient
     local sched="${SCHEDULE:-0 2 * * *}"
     if have_systemd; then
         [ "$(id -u)" -eq 0 ] || nw_die "systemd scheduling requires root"
         local oncal="${SYSTEMD_ONCALENDAR:-*-*-* 02:00:00}"
-        cat > /etc/systemd/system/nightwatch.service <<UNIT
+        local svc=/etc/systemd/system/nightwatch.service tmr=/etc/systemd/system/nightwatch.timer
+        cat > "$svc" <<UNIT || nw_die "Cannot write $svc"
 [Unit]
 Description=Nightwatch Backup
 After=network-online.target local-fs.target
 
 [Service]
 Type=oneshot
-Environment=NW_CONFIG=$NW_CONFIG
-ExecStart=$ENGINE -q -c $NW_CONFIG
+Environment=$(sd_quote "NW_CONFIG=$NW_CONFIG")
+Environment=$(sd_quote "NW_STATE_DIR=$NW_STATE_DIR")
+Environment=$(sd_quote "NW_LOG_DIR=$NW_LOG_DIR")
+ExecStart=$(sd_quote "$ENGINE") -q -c $(sd_quote "$NW_CONFIG")
 Nice=10
 IOSchedulingClass=idle
 UNIT
-        cat > /etc/systemd/system/nightwatch.timer <<UNIT
+        cat > "$tmr" <<UNIT || nw_die "Cannot write $tmr"
 [Unit]
 Description=Nightwatch Backup timer
 
@@ -145,26 +153,32 @@ RandomizedDelaySec=300
 [Install]
 WantedBy=timers.target
 UNIT
-        systemctl daemon-reload
-        systemctl enable --now nightwatch.timer
+        systemctl daemon-reload            || nw_die "systemctl daemon-reload failed"
+        systemctl enable --now nightwatch.timer || nw_die "systemctl enable nightwatch.timer failed"
         echo "systemd timer enabled (OnCalendar=$oncal)"
     else
         command -v crontab >/dev/null 2>&1 || nw_die "crontab not found"
-        local line="$sched NW_CONFIG=$NW_CONFIG $ENGINE -q -c $NW_CONFIG $CRON_TAG"
-        { crontab -l 2>/dev/null | grep -v "$CRON_TAG"; echo "$line"; } | crontab -
+        local cmd
+        cmd="NW_CONFIG=$(sh_quote "$NW_CONFIG") NW_STATE_DIR=$(sh_quote "$NW_STATE_DIR") NW_LOG_DIR=$(sh_quote "$NW_LOG_DIR") $(sh_quote "$ENGINE") -q -c $(sh_quote "$NW_CONFIG")"
+        local line="$sched $cmd $CRON_TAG"
+        local existing; existing="$(crontab -l 2>/dev/null | grep -v "$CRON_TAG" || true)"
+        printf '%s\n' "$existing" "$line" | sed '/^$/d' | crontab - || nw_die "crontab install failed"
+        crontab -l 2>/dev/null | grep -qF "$CRON_TAG" || nw_die "crontab entry not present after install"
         echo "cron entry installed: $sched"
     fi
 }
 
 schedule_disable() {
     if have_systemd && [ -f /etc/systemd/system/nightwatch.timer ]; then
-        systemctl disable --now nightwatch.timer 2>/dev/null || true
-        rm -f /etc/systemd/system/nightwatch.timer /etc/systemd/system/nightwatch.service
-        systemctl daemon-reload
+        systemctl disable --now nightwatch.timer || nw_die "systemctl disable failed"
+        rm -f /etc/systemd/system/nightwatch.timer /etc/systemd/system/nightwatch.service || nw_die "cannot remove unit files"
+        systemctl daemon-reload || nw_die "systemctl daemon-reload failed"
         echo "systemd timer removed"
     fi
-    if command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -q "$CRON_TAG"; then
-        crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
+    if command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -qF "$CRON_TAG"; then
+        local rest; rest="$(crontab -l 2>/dev/null | grep -vF "$CRON_TAG" || true)"
+        if [ -z "$rest" ]; then crontab -r || nw_die "crontab -r failed"
+        else printf '%s\n' "$rest" | crontab - || nw_die "crontab update failed"; fi
         echo "cron entry removed"
     fi
 }
@@ -174,7 +188,7 @@ schedule_status() {
         systemctl list-timers nightwatch.timer --no-pager 2>/dev/null || true
     fi
     if command -v crontab >/dev/null 2>&1; then
-        local c; c="$(crontab -l 2>/dev/null | grep "$CRON_TAG" || true)"
+        local c; c="$(crontab -l 2>/dev/null | grep -F "$CRON_TAG" || true)"
         [ -n "$c" ] && echo "cron: $c" || echo "cron: not scheduled"
     fi
 }

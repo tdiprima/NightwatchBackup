@@ -3,6 +3,8 @@
 # Usage: sudo ./install.sh [--prefix /usr/local] [--config /etc/nightwatch/nightwatch.conf] [--uninstall]
 set -o nounset
 set -o pipefail
+set -o errexit
+trap 'echo "install.sh: FAILED at line $LINENO (command: $BASH_COMMAND)" >&2' ERR
 
 PREFIX="/usr/local"
 CONFIG="/etc/nightwatch/nightwatch.conf"
@@ -52,14 +54,20 @@ fi
 
 # Bake non-default paths into a small env wrapper if the user changed them.
 if [ "$CONFIG" != "/etc/nightwatch/nightwatch.conf" ] || [ "$STATE_DIR" != "/var/lib/nightwatch" ] || [ "$LOG_DIR" != "/var/log/nightwatch" ]; then
-    cat > "$LIB/env.sh" <<ENV
-NW_CONFIG="\${NW_CONFIG:-$CONFIG}"
-NW_STATE_DIR="\${NW_STATE_DIR:-$STATE_DIR}"
-NW_LOG_DIR="\${NW_LOG_DIR:-$LOG_DIR}"
-ENV
+    # shellcheck disable=SC2016
+    {
+        printf 'NW_CONFIG="${NW_CONFIG:-%s}"\n'    "$CONFIG"
+        printf 'NW_STATE_DIR="${NW_STATE_DIR:-%s}"\n' "$STATE_DIR"
+        printf 'NW_LOG_DIR="${NW_LOG_DIR:-%s}"\n'    "$LOG_DIR"
+    } > "$LIB/env.sh"
     # Prepend env sourcing into installed common.sh
-    { echo ". \"$LIB/env.sh\""; cat "$SRC/lib/common.sh"; } > "$LIB/common.sh"
+    { printf '. %q\n' "$LIB/env.sh"; cat "$SRC/lib/common.sh"; } > "$LIB/common.sh"
 fi
+
+# Post-install self-check
+[ -x "$BIN/nightwatchctl" ] && [ -x "$BIN/nightwatch.sh" ] && [ -r "$LIB/common.sh" ] && [ -r "$CONFIG" ] \
+    || { echo "install.sh: post-install check failed" >&2; exit 1; }
+"$BIN/nightwatchctl" version >/dev/null || { echo "install.sh: installed nightwatchctl does not run" >&2; exit 1; }
 
 echo "Installed:"
 echo "  $BIN/nightwatch.sh"
