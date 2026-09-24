@@ -1,10 +1,14 @@
+# Nightwatch Backup systemd service template.
+# Rendered by 'nightwatchctl schedule enable' (or 'nightwatchctl schedule render').
 [Unit]
 Description=Nightwatch Backup
 After=network-online.target local-fs.target
 
 [Service]
 Type=oneshot
-Environment=NW_CONFIG=/etc/nightwatch/nightwatch.conf
-ExecStart=/usr/local/bin/nightwatch.sh -q
+Environment=@SD_ENV_CONFIG@
+Environment=@SD_ENV_STATE@
+Environment=@SD_ENV_LOG@
+ExecStart=@SD_ENGINE@ -q -c @SD_CONFIG@
 Nice=10
 IOSchedulingClass=idle

@@ -40,6 +40,9 @@ VERIFY=true
 # rsync --bwlimit in KB/s (0 = unlimited).
 BANDWIDTH_LIMIT=0
 
+# Number of published manifests to keep under DESTINATION/.nightwatch/manifests.
+KEEP_MANIFESTS=5
+
 # Delete run logs older than this many days (0 = keep forever).
 KEEP_LOGS_DAYS=30
 

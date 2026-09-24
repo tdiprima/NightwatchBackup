@@ -40,14 +40,13 @@ mkdir -p "$NW_STATE_DIR" "$NW_LOG_DIR" 2>/dev/null || nw_die "Cannot create $NW_
 RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
 NW_LOG_FILE="$NW_LOG_DIR/nightwatch-$RUN_ID.log"
 STATUS_FILE="$NW_STATE_DIR/last-run.status"
-LOCK_DIR="$NW_STATE_DIR/nightwatch.lock"
 
 # ---------------------------------------------------------------------------
 # Status file writer (consumed by nightwatchctl status). Values are %q-escaped
 # so the file is safe to source even when paths contain spaces or quotes.
 # ---------------------------------------------------------------------------
 START_TS="$(nw_now)"
-VERIFIED=no; MANIFEST_COUNT=0; FINALIZED=0
+VERIFIED=no; MANIFEST_COUNT=0; FINALIZED=0; MANIFEST_NAME=""
 write_status() {
     local result="$1" rc="$2"
     local tmp="$STATUS_FILE.tmp.$$"
@@ -62,42 +61,19 @@ write_status() {
         printf 'LOG=%q\n'               "$NW_LOG_FILE"
         printf 'VERIFIED=%q\n'          "$VERIFIED"
         printf 'FILES_IN_MANIFEST=%q\n' "$MANIFEST_COUNT"
+        printf 'MANIFEST=%q\n'         "$MANIFEST_NAME"
         printf 'DRY_RUN=%q\n'           "$DRY_RUN"
     } > "$tmp" && mv -f "$tmp" "$STATUS_FILE"
 }
 finish() { write_status "$1" "$2"; FINALIZED=1; exit "$2"; }
 
 # ---------------------------------------------------------------------------
-# Locking. mkdir is atomic on both platforms (macOS lacks flock by default).
-# Stale-lock reclamation is serialized by renaming the lock dir: only one
-# process can win the rename, so two reclaimers can never delete each other's
-# freshly created lock.
+# Locking (ARCH-1): destination-based lock from lib/common.sh, shared with
+# nightwatchctl verify so verification never reads a destination mid-write.
 # ---------------------------------------------------------------------------
-HAVE_LOCK=0
-acquire_lock() {
-    local waited=0 owner stale
-    while ! mkdir "$LOCK_DIR" 2>/dev/null; do
-        owner="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
-        if [ -n "$owner" ] && ! nw_pid_alive "$owner"; then
-            stale="$LOCK_DIR.stale.$$"
-            if mv "$LOCK_DIR" "$stale" 2>/dev/null; then
-                nw_warn "Removed stale lock (pid $owner is dead)"
-                rm -rf "$stale"
-            fi
-            continue
-        fi
-        if [ "$LOCK_TIMEOUT" -gt 0 ] && [ "$waited" -lt "$LOCK_TIMEOUT" ]; then
-            sleep 5; waited=$((waited+5)); continue
-        fi
-        nw_error "Another Nightwatch run is active (pid ${owner:-unknown}); exiting"
-        finish "SKIPPED_LOCKED" 2
-    done
-    echo $$ > "$LOCK_DIR/pid"
-    HAVE_LOCK=1
-}
 cleanup() {
     local rc=$?
-    [ "$HAVE_LOCK" = 1 ] && rm -rf "$LOCK_DIR"
+    nw_lock_release
     if [ "$rc" -ne 0 ] && [ "$FINALIZED" = 0 ]; then
         write_status "FAILED" "$rc"
     fi
@@ -111,10 +87,12 @@ trap 'nw_error "Interrupted"; exit 130' INT TERM
 # ---------------------------------------------------------------------------
 nw_info "Nightwatch Backup v$NW_VERSION starting (run $RUN_ID, $(nw_os), pid $$)"
 nw_info "Config: $NW_CONFIG_LOADED"
-acquire_lock
-
 [ -d "$DESTINATION" ] || mkdir -p "$DESTINATION" || nw_die "Cannot create destination: $DESTINATION"
 [ -w "$DESTINATION" ] || nw_die "Destination not writable: $DESTINATION"
+if ! nw_lock_acquire "$LOCK_TIMEOUT"; then
+    nw_error "Destination is locked by another Nightwatch process (pid ${NW_LOCK_OWNER:-unknown}); exiting"
+    finish "SKIPPED_LOCKED" 2
+fi
 
 if [ -n "$PRE_HOOK" ]; then
     nw_info "Running PRE_HOOK"
@@ -159,11 +137,10 @@ run_rsync() {
 }
 
 OVERALL_RC=0
-for src in "${SOURCES[@]}"; do
-    src="$(nw_abspath "$src")"
-    dst="$DESTINATION/$(basename "$src")"
+for i in "${!NW_SRC_ABS[@]}"; do
+    dst="$NW_DEST_ABS/${NW_SRC_NAME[$i]}"
     [ "$DRY_RUN" = 1 ] || mkdir -p "$dst" || nw_die "Cannot create $dst"
-    run_rsync "$src" "$dst" || OVERALL_RC=3
+    run_rsync "${NW_SRC_ABS[$i]}" "$dst" || OVERALL_RC=3
 done
 [ "$OVERALL_RC" -eq 0 ] || finish "FAILED_RSYNC" 3
 
@@ -173,45 +150,45 @@ if [ "$DRY_RUN" = 1 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# SHA-256 manifest + immediate verification. Any hash or write failure is fatal:
-# a backup is never reported as verified unless every file was hashed and matched.
+# SHA-256 manifest + immediate verification (ARCH-2).
+# The candidate manifest is built and verified in a temp file. Only after it
+# passes is it published by atomically replacing .nightwatch/CURRENT, which
+# records the run ID and verification state. A failed run leaves the previous
+# published manifest untouched.
 # ---------------------------------------------------------------------------
 if [ "$CHECKSUM_MANIFEST" = true ]; then
-    MANIFEST="$DESTINATION/.nightwatch/SHA256SUMS"
-    mkdir -p "$DESTINATION/.nightwatch" || nw_die "Cannot create $DESTINATION/.nightwatch"
-    tmp_manifest="$MANIFEST.tmp.$$"
+    mkdir -p "$NW_MANIFEST_DIR" || nw_die "Cannot create $NW_MANIFEST_DIR"
+    MANIFEST_NAME="$RUN_ID.sha256"
+    candidate="$NW_MANIFEST_DIR/$MANIFEST_NAME.candidate"
     hash_err="$NW_STATE_DIR/hash-errors-$RUN_ID.txt"
     : > "$hash_err"
     nw_info "Generating SHA-256 manifest"
-    : > "$tmp_manifest" || nw_die "Cannot write $tmp_manifest"
-    for src in "${SOURCES[@]}"; do
-        name="$(basename "$(nw_abspath "$src")")"
+    : > "$candidate" || nw_die "Cannot write $candidate"
+    for name in "${NW_SRC_NAME[@]}"; do
         # NUL-safe walk; paths written relative to DESTINATION with sha256sum escaping.
-        ( cd "$DESTINATION" && find "$name" -type f -print0 ) | while IFS= read -r -d '' f; do
-            if h="$(nw_sha256 "$DESTINATION/$f")" && [ -n "$h" ]; then
-                nw_manifest_encode "$f" "$h" || { printf 'write %s\n' "$f" >> "$hash_err"; }
+        ( cd "$NW_DEST_ABS" && find "$name" -type f -print0 ) | while IFS= read -r -d '' f; do
+            if h="$(nw_sha256 "$NW_DEST_ABS/$f")" && [ -n "$h" ]; then
+                nw_manifest_encode "$f" "$h" || printf 'write %s\n' "$f" >> "$hash_err"
             else
                 printf 'hash %s\n' "$f" >> "$hash_err"
             fi
-        done >> "$tmp_manifest"
+        done >> "$candidate"
         st=("${PIPESTATUS[@]}")
         if [ "${st[0]}" -ne 0 ] || [ "${st[1]}" -ne 0 ]; then
             nw_error "Manifest generation failed for $name (find=${st[0]} loop=${st[1]})"
-            rm -f "$tmp_manifest"; finish "FAILED_MANIFEST" 4
+            rm -f "$candidate"; finish "FAILED_MANIFEST" 4
         fi
     done
     if [ -s "$hash_err" ]; then
         nw_error "Manifest incomplete: $(wc -l < "$hash_err" | tr -d ' ') file(s) could not be hashed (see $hash_err)"
-        rm -f "$tmp_manifest"; finish "FAILED_MANIFEST" 4
+        rm -f "$candidate"; finish "FAILED_MANIFEST" 4
     fi
     rm -f "$hash_err"
-    sync 2>/dev/null || true
-    mv -f "$tmp_manifest" "$MANIFEST" || nw_die "Cannot write $MANIFEST"
-    MANIFEST_COUNT="$(wc -l < "$MANIFEST" | tr -d ' ')"
-    nw_info "Manifest written: $MANIFEST ($MANIFEST_COUNT files)"
+    MANIFEST_COUNT="$(wc -l < "$candidate" | tr -d ' ')"
+    nw_info "Candidate manifest: $MANIFEST_COUNT files"
 
     if [ "$VERIFY" = true ]; then
-        nw_info "Verifying destination against source (SHA-256)"
+        nw_info "Verifying candidate against source (SHA-256)"
         vfail=0; vskip=0; verr=0
         vfail_list="$NW_STATE_DIR/verify-failures-$RUN_ID.txt"; : > "$vfail_list"
         while IFS= read -r line || [ -n "$line" ]; do
@@ -220,17 +197,12 @@ if [ "$CHECKSUM_MANIFEST" = true ]; then
             h="$NW_M_HASH"; rel="$NW_M_PATH"
             top="${rel%%/*}"; rest="${rel#*/}"
             [ "$top" = "$rel" ] && rest=""
-            srcroot=""
-            for s in "${SOURCES[@]}"; do
-                [ "$(basename "$(nw_abspath "$s")")" = "$top" ] && { srcroot="$(nw_abspath "$s")"; break; }
-            done
-            if [ -z "$srcroot" ]; then
+            if ! idx="$(nw_src_index "$top")"; then
                 printf 'NOSOURCE %s\n' "$rel" >> "$vfail_list"; verr=$((verr+1)); continue
             fi
-            srcfile="$srcroot${rest:+/$rest}"
+            srcfile="${NW_SRC_ABS[$idx]}${rest:+/$rest}"
             if [ ! -f "$srcfile" ]; then
-                # Source deleted since sync: not backup corruption, but recorded.
-                vskip=$((vskip+1)); continue
+                vskip=$((vskip+1)); continue      # deleted at source after sync; not corruption
             fi
             if ! sh="$(nw_sha256 "$srcfile")" || [ -z "$sh" ]; then
                 printf 'HASHERR  %s\n' "$rel" >> "$vfail_list"; verr=$((verr+1)); continue
@@ -238,16 +210,24 @@ if [ "$CHECKSUM_MANIFEST" = true ]; then
             if [ "$sh" != "$h" ]; then
                 printf 'MISMATCH %s\n' "$rel" >> "$vfail_list"; vfail=$((vfail+1))
             fi
-        done < "$MANIFEST"
+        done < "$candidate"
         if [ "$vfail" -gt 0 ] || [ "$verr" -gt 0 ]; then
-            nw_error "Verification FAILED: $vfail mismatch(es), $verr error(s) (see $vfail_list)"
-            finish "FAILED_VERIFY" 4
+            nw_error "Verification FAILED: $vfail mismatch(es), $verr error(s) (see $vfail_list); manifest NOT published"
+            rm -f "$candidate"; finish "FAILED_VERIFY" 4
         fi
         rm -f "$vfail_list"
         VERIFIED=yes
         [ "$vskip" -gt 0 ] && nw_warn "$vskip source file(s) vanished after sync; skipped in verification"
         nw_info "Verification OK"
     fi
+
+    sync 2>/dev/null || true
+    mv -f "$candidate" "$NW_MANIFEST_DIR/$MANIFEST_NAME" || nw_die "Cannot write manifest"
+    nw_current_publish "$MANIFEST_NAME" "$RUN_ID" "$VERIFIED" || nw_die "Cannot publish $NW_CURRENT"
+    nw_info "Published manifest $MANIFEST_NAME (verified=$VERIFIED)"
+    # keep the newest KEEP_MANIFESTS manifests (names are our own RUN_ID.sha256 format)
+    # shellcheck disable=SC2012
+    ls -1t "$NW_MANIFEST_DIR"/*.sha256 2>/dev/null | tail -n +"$(( ${KEEP_MANIFESTS:-5} + 1 ))" | while IFS= read -r old; do rm -f "$old"; done
 fi
 
 if [ -n "$POST_HOOK" ]; then

@@ -1,8 +1,9 @@
+# Nightwatch Backup systemd timer template.
 [Unit]
 Description=Nightwatch Backup timer
 
 [Timer]
-OnCalendar=*-*-* 02:00:00
+OnCalendar=@ONCALENDAR@
 Persistent=true
 RandomizedDelaySec=300
 

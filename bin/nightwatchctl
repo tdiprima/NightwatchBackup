@@ -5,6 +5,7 @@ set -o pipefail
 
 NW_HERE="$(cd "$(dirname "$0")" && pwd -P)"
 for _lib in "$NW_HERE/../lib/common.sh" "$NW_HERE/../lib/nightwatch/common.sh" "/usr/local/lib/nightwatch/common.sh"; do
+    # shellcheck disable=SC1090
     if [ -r "$_lib" ]; then . "$_lib"; break; fi
 done
 command -v nw_log >/dev/null 2>&1 || { echo "nightwatchctl: cannot locate lib/common.sh" >&2; exit 1; }
@@ -12,7 +13,12 @@ command -v nw_log >/dev/null 2>&1 || { echo "nightwatchctl: cannot locate lib/co
 ENGINE="$NW_HERE/nightwatch.sh"
 [ -x "$ENGINE" ] || ENGINE="$NW_PREFIX/bin/nightwatch.sh"
 STATUS_FILE="$NW_STATE_DIR/last-run.status"
-LOCK_DIR="$NW_STATE_DIR/nightwatch.lock"
+# Scheduling templates (ARCH-4): one source of truth, rendered at enable time.
+for _t in "$NW_HERE/../scheduling" "$NW_PREFIX/share/nightwatch/scheduling"; do
+    if [ -d "$_t" ]; then TEMPLATE_DIR="$(cd "$_t" && pwd -P)"; break; fi
+done
+TEMPLATE_DIR="${TEMPLATE_DIR:-}"
+trap 'nw_lock_release' EXIT
 
 usage() {
 cat <<USAGE
@@ -22,15 +28,16 @@ Usage: nightwatchctl <command> [options]
 
 Commands:
   run [-n] [-v]        Run a backup now (-n dry run, -v verbose)
-  status               Show last run result and lock state
-  verify               Re-verify destination against its SHA-256 manifest
+  status               Show last run result, published manifest, and lock state
+  verify               Re-verify destination against its published manifest (takes the destination lock)
   logs [N]             Show the last N lines of the latest log (default 50)
   config               Show the effective configuration
   check                Validate config, tools, and paths without running
-  unlock               Remove a stale lock (refuses if the owner is alive)
-  schedule enable      Install cron (macOS/Linux) or systemd timer (Linux)
+  unlock               Remove a stale destination lock (refuses if the owner is alive)
+  schedule enable      Install systemd timer (Linux) or cron entry (Linux/macOS)
   schedule disable     Remove the schedule
   schedule status      Show schedule state
+  schedule render      Print the rendered schedule files without installing
   version
 
 Environment: NW_CONFIG=$NW_CONFIG  NW_STATE_DIR=$NW_STATE_DIR  NW_LOG_DIR=$NW_LOG_DIR
@@ -39,13 +46,24 @@ USAGE
 
 cmd_run() { exec "$ENGINE" -c "$NW_CONFIG" "$@"; }
 
-cmd_status() {
-    if [ -d "$LOCK_DIR" ]; then
-        local pid; pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || echo '?')"
-        if nw_pid_alive "$pid" 2>/dev/null; then echo "Lock:   HELD by pid $pid (backup running)"
-        else echo "Lock:   STALE (pid $pid dead) - run 'nightwatchctl unlock'"; fi
+lock_state() {
+    if [ -d "$NW_LOCK_DIR" ]; then
+        local pid; pid="$(cat "$NW_LOCK_DIR/pid" 2>/dev/null || echo '?')"
+        local info; info="$(cat "$NW_LOCK_DIR/info" 2>/dev/null || true)"
+        if nw_pid_alive "$pid" 2>/dev/null; then echo "Lock:     HELD by pid $pid ${info:+($info)}"
+        else echo "Lock:     STALE (pid $pid dead) - run 'nightwatchctl unlock'"; fi
     else
-        echo "Lock:   free"
+        echo "Lock:     free"
+    fi
+}
+
+cmd_status() {
+    nw_load_config "$NW_CONFIG" lenient
+    lock_state
+    if nw_current_read; then
+        echo "Manifest: $MANIFEST  (run $MANIFEST_RUN_ID, verified=$MANIFEST_VERIFIED, $(nw_date "$MANIFEST_TS"))"
+    else
+        echo "Manifest: none published"
     fi
     if [ ! -r "$STATUS_FILE" ]; then echo "Last run: never"; return 0; fi
     # shellcheck disable=SC1090
@@ -53,19 +71,25 @@ cmd_status() {
     local dur=$(( ${END:-0} - ${START:-0} ))
     echo "Last run: $RUN_ID"
     echo "Result:   $RESULT (exit $EXIT_CODE)"
-    echo "Ended:    $(date -r "$END" +'%Y-%m-%d %H:%M:%S' 2>/dev/null || date -d "@$END" +'%Y-%m-%d %H:%M:%S')  (${dur}s)"
+    echo "Ended:    $(nw_date "$END")  (${dur}s)"
     echo "Verified: $VERIFIED   Files in manifest: $FILES_IN_MANIFEST"
     echo "Dest:     $DESTINATION"
     echo "Log:      $LOG"
     [ "$RESULT" = OK ] || [ "$RESULT" = DRY_RUN_OK ]
 }
 
+# Verify destination against the published manifest under the destination lock,
+# so a concurrent backup cannot rewrite files while they are being hashed.
 cmd_verify() {
     nw_load_config "$NW_CONFIG" lenient
-    local manifest="$DESTINATION/.nightwatch/SHA256SUMS"
-    [ -r "$manifest" ] || nw_die "No manifest at $manifest (run a backup first)"
-    echo "Verifying $(wc -l < "$manifest" | tr -d ' ') files in $DESTINATION ..."
-    if nw_sha256_check "$manifest" "$DESTINATION"; then
+    nw_current_read || nw_die "No published manifest in $NW_META_DIR (run a backup first)"
+    if ! nw_lock_acquire "${LOCK_TIMEOUT:-0}"; then
+        nw_die "Destination is locked by another Nightwatch process (pid ${NW_LOCK_OWNER:-unknown}); try again later"
+    fi
+    local mf="$NW_MANIFEST_DIR/$MANIFEST"
+    echo "Manifest $MANIFEST from run $MANIFEST_RUN_ID (source-verified at backup time: $MANIFEST_VERIFIED)"
+    echo "Verifying $(wc -l < "$mf" | tr -d ' ') files in $NW_DEST_ABS ..."
+    if nw_sha256_check "$mf" "$NW_DEST_ABS"; then
         echo "Integrity OK"; return 0
     else
         echo "Integrity FAILED" >&2; return 4
@@ -74,7 +98,7 @@ cmd_verify() {
 
 cmd_logs() {
     local n="${1:-50}" latest
-    latest="$(ls -1t "$NW_LOG_DIR"/nightwatch-*.log 2>/dev/null | head -1)"
+    latest="$(find "$NW_LOG_DIR" -maxdepth 1 -name 'nightwatch-*.log' -type f 2>/dev/null | sort | tail -1)"
     [ -n "$latest" ] || nw_die "No logs in $NW_LOG_DIR"
     echo "== $latest =="; tail -n "$n" "$latest"
 }
@@ -82,33 +106,36 @@ cmd_logs() {
 cmd_config() {
     nw_load_config "$NW_CONFIG"
     echo "CONFIG=$NW_CONFIG_LOADED"
-    printf 'SOURCES=%s\n' "${SOURCES[*]}"
-    echo "DESTINATION=$DESTINATION"
+    local i
+    for i in "${!NW_SRC_ABS[@]}"; do echo "SOURCE[$i]=${NW_SRC_ABS[$i]} -> $NW_DEST_ABS/${NW_SRC_NAME[$i]}/"; done
+    echo "DESTINATION=$NW_DEST_ABS"
     printf 'EXCLUDES=%s\n' "${EXCLUDES[*]:-}"
     echo "RETRIES=$RETRIES RETRY_DELAY=$RETRY_DELAY LOCK_TIMEOUT=$LOCK_TIMEOUT"
     echo "VERIFY=$VERIFY CHECKSUM_MANIFEST=$CHECKSUM_MANIFEST DELETE_EXTRANEOUS=$DELETE_EXTRANEOUS"
-    echo "BANDWIDTH_LIMIT=$BANDWIDTH_LIMIT KEEP_LOGS_DAYS=$KEEP_LOGS_DAYS"
+    echo "BANDWIDTH_LIMIT=$BANDWIDTH_LIMIT KEEP_LOGS_DAYS=$KEEP_LOGS_DAYS KEEP_MANIFESTS=$KEEP_MANIFESTS"
     echo "SCHEDULE=${SCHEDULE:-0 2 * * *}"
 }
 
 cmd_check() {
-    local ok=0
+    local ok=0 t
     for t in rsync find awk; do
-        command -v "$t" >/dev/null 2>&1 && echo "ok    $t" || { echo "MISSING $t"; ok=1; }
+        if command -v "$t" >/dev/null 2>&1; then echo "ok    $t"; else echo "MISSING $t"; ok=1; fi
     done
-    nw_sha256 /dev/null >/dev/null 2>&1 && echo "ok    sha256 (via $(command -v sha256sum || command -v shasum || command -v openssl))" || { echo "MISSING sha256 tool"; ok=1; }
+    if nw_sha256 /dev/null >/dev/null 2>&1; then echo "ok    sha256 (via $(command -v sha256sum || command -v shasum || command -v openssl))"; else echo "MISSING sha256 tool"; ok=1; fi
     nw_load_config "$NW_CONFIG" && echo "ok    config $NW_CONFIG_LOADED"
-    [ -d "$DESTINATION" ] && [ -w "$DESTINATION" ] && echo "ok    destination writable" || echo "warn  destination missing/unwritable (will attempt mkdir): $DESTINATION"
-    [ -x "$ENGINE" ] && echo "ok    engine $ENGINE" || { echo "MISSING engine $ENGINE"; ok=1; }
-    mkdir -p "$NW_STATE_DIR" "$NW_LOG_DIR" 2>/dev/null && echo "ok    state/log dirs" || { echo "FAIL  cannot create $NW_STATE_DIR / $NW_LOG_DIR"; ok=1; }
+    if [ -d "$DESTINATION" ] && [ -w "$DESTINATION" ]; then echo "ok    destination writable"; else echo "warn  destination missing/unwritable (will attempt mkdir): $DESTINATION"; fi
+    if [ -x "$ENGINE" ]; then echo "ok    engine $ENGINE"; else echo "MISSING engine $ENGINE"; ok=1; fi
+    if [ -n "$TEMPLATE_DIR" ]; then echo "ok    templates $TEMPLATE_DIR"; else echo "warn  scheduling templates not found"; fi
+    if mkdir -p "$NW_STATE_DIR" "$NW_LOG_DIR" 2>/dev/null; then echo "ok    state/log dirs"; else echo "FAIL  cannot create $NW_STATE_DIR / $NW_LOG_DIR"; ok=1; fi
     return $ok
 }
 
 cmd_unlock() {
-    [ -d "$LOCK_DIR" ] || { echo "No lock present"; return 0; }
-    local pid; pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || echo '')"
+    nw_load_config "$NW_CONFIG" lenient
+    [ -d "$NW_LOCK_DIR" ] || { echo "No lock present"; return 0; }
+    local pid; pid="$(cat "$NW_LOCK_DIR/pid" 2>/dev/null || echo '')"
     if [ -n "$pid" ] && nw_pid_alive "$pid"; then nw_die "Refusing: pid $pid is still running"; fi
-    rm -rf "$LOCK_DIR" && echo "Stale lock removed"
+    rm -rf "$NW_LOCK_DIR" && echo "Stale lock removed"
 }
 
 # --- scheduling -------------------------------------------------------------
@@ -120,51 +147,55 @@ sd_quote() { local v="$1"; v="${v//\\/\\\\}"; v="${v//\"/\\\"}"; printf '"%s"' "
 # sh single-quote for cron command lines.
 sh_quote() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
 
+# render TEMPLATE_NAME -> stdout, substituting @PLACEHOLDER@ tokens with bash
+# expansion (no sed, so values need no extra escaping beyond the target format).
+render_template() {
+    local f="$TEMPLATE_DIR/$1" t
+    [ -r "$f" ] || nw_die "Template not found: $f"
+    t="$(cat "$f")"
+    t="${t//@SD_ENV_CONFIG@/$(sd_quote "NW_CONFIG=$NW_CONFIG")}"
+    t="${t//@SD_ENV_STATE@/$(sd_quote "NW_STATE_DIR=$NW_STATE_DIR")}"
+    t="${t//@SD_ENV_LOG@/$(sd_quote "NW_LOG_DIR=$NW_LOG_DIR")}"
+    t="${t//@SD_ENGINE@/$(sd_quote "$ENGINE")}"
+    t="${t//@SD_CONFIG@/$(sd_quote "$NW_CONFIG")}"
+    t="${t//@ONCALENDAR@/${SYSTEMD_ONCALENDAR:-*-*-* 02:00:00}}"
+    t="${t//@SCHEDULE@/${SCHEDULE:-0 2 * * *}}"
+    t="${t//@SH_CONFIG@/$(sh_quote "$NW_CONFIG")}"
+    t="${t//@SH_STATE@/$(sh_quote "$NW_STATE_DIR")}"
+    t="${t//@SH_LOG@/$(sh_quote "$NW_LOG_DIR")}"
+    t="${t//@SH_ENGINE@/$(sh_quote "$ENGINE")}"
+    case "$t" in *@[A-Z_]*@*) nw_die "Template $1 has an unrendered placeholder";; esac
+    printf '%s\n' "$t"
+}
+
+schedule_render() {
+    nw_load_config "$NW_CONFIG" lenient
+    if have_systemd; then
+        echo "# --- /etc/systemd/system/nightwatch.service"; render_template nightwatch.service
+        echo "# --- /etc/systemd/system/nightwatch.timer";   render_template nightwatch.timer
+    else
+        echo "# --- crontab entry"; render_template nightwatch.cron | grep -v '^#'
+    fi
+}
+
 schedule_enable() {
     nw_load_config "$NW_CONFIG" lenient
-    local sched="${SCHEDULE:-0 2 * * *}"
     if have_systemd; then
         [ "$(id -u)" -eq 0 ] || nw_die "systemd scheduling requires root"
-        local oncal="${SYSTEMD_ONCALENDAR:-*-*-* 02:00:00}"
         local svc=/etc/systemd/system/nightwatch.service tmr=/etc/systemd/system/nightwatch.timer
-        cat > "$svc" <<UNIT || nw_die "Cannot write $svc"
-[Unit]
-Description=Nightwatch Backup
-After=network-online.target local-fs.target
-
-[Service]
-Type=oneshot
-Environment=$(sd_quote "NW_CONFIG=$NW_CONFIG")
-Environment=$(sd_quote "NW_STATE_DIR=$NW_STATE_DIR")
-Environment=$(sd_quote "NW_LOG_DIR=$NW_LOG_DIR")
-ExecStart=$(sd_quote "$ENGINE") -q -c $(sd_quote "$NW_CONFIG")
-Nice=10
-IOSchedulingClass=idle
-UNIT
-        cat > "$tmr" <<UNIT || nw_die "Cannot write $tmr"
-[Unit]
-Description=Nightwatch Backup timer
-
-[Timer]
-OnCalendar=$oncal
-Persistent=true
-RandomizedDelaySec=300
-
-[Install]
-WantedBy=timers.target
-UNIT
-        systemctl daemon-reload            || nw_die "systemctl daemon-reload failed"
+        { render_template nightwatch.service > "$svc.tmp" && mv -f "$svc.tmp" "$svc"; } || nw_die "Cannot write $svc"
+        { render_template nightwatch.timer   > "$tmr.tmp" && mv -f "$tmr.tmp" "$tmr"; } || nw_die "Cannot write $tmr"
+        systemctl daemon-reload                 || nw_die "systemctl daemon-reload failed"
         systemctl enable --now nightwatch.timer || nw_die "systemctl enable nightwatch.timer failed"
-        echo "systemd timer enabled (OnCalendar=$oncal)"
+        echo "systemd timer enabled (OnCalendar=${SYSTEMD_ONCALENDAR:-*-*-* 02:00:00})"
     else
         command -v crontab >/dev/null 2>&1 || nw_die "crontab not found"
-        local cmd
-        cmd="NW_CONFIG=$(sh_quote "$NW_CONFIG") NW_STATE_DIR=$(sh_quote "$NW_STATE_DIR") NW_LOG_DIR=$(sh_quote "$NW_LOG_DIR") $(sh_quote "$ENGINE") -q -c $(sh_quote "$NW_CONFIG")"
-        local line="$sched $cmd $CRON_TAG"
-        local existing; existing="$(crontab -l 2>/dev/null | grep -v "$CRON_TAG" || true)"
+        local line existing
+        line="$(render_template nightwatch.cron | grep -v '^#')" || nw_die "Cannot render cron template"
+        existing="$(crontab -l 2>/dev/null | grep -vF "$CRON_TAG" || true)"
         printf '%s\n' "$existing" "$line" | sed '/^$/d' | crontab - || nw_die "crontab install failed"
         crontab -l 2>/dev/null | grep -qF "$CRON_TAG" || nw_die "crontab entry not present after install"
-        echo "cron entry installed: $sched"
+        echo "cron entry installed: ${SCHEDULE:-0 2 * * *}"
     fi
 }
 
@@ -189,7 +220,7 @@ schedule_status() {
     fi
     if command -v crontab >/dev/null 2>&1; then
         local c; c="$(crontab -l 2>/dev/null | grep -F "$CRON_TAG" || true)"
-        [ -n "$c" ] && echo "cron: $c" || echo "cron: not scheduled"
+        if [ -n "$c" ]; then echo "cron: $c"; else echo "cron: not scheduled"; fi
     fi
 }
 
@@ -206,6 +237,7 @@ case "${1:-}" in
             enable)  schedule_enable ;;
             disable) schedule_disable ;;
             status)  schedule_status ;;
+            render)  schedule_render ;;
             *) usage; exit 1 ;;
         esac ;;
     version)  echo "nightwatchctl $NW_VERSION" ;;
